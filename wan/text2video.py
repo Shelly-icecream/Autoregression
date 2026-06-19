@@ -121,7 +121,28 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 context_override=None,
+                 context_null_override=None,
+                 return_velocity_cache=False,
+                 prev_velocity_tail_cache=None,
+                 velocity_overlap=4,
+                 velocity_alpha_start=0.4,
+                 velocity_start_step_ratio=0.6,
+                 velocity_end_step_ratio=0.9,
+                 
+                 return_noise_tail_cache=False,
+                 prev_noise_tail_cache=None,
+                 noise_overlap=4,
+                 
+                 return_hidden_tail_cache=False,
+                 prev_hidden_tail_cache=None,
+                 hidden_overlap=2,
+                 hidden_alpha=0.03,
+                 hidden_use_step_ratio=0.4,
+                 hidden_block_start=8,
+                 hidden_block_end=20,
+                 ):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -171,17 +192,29 @@ class WanT2V:
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
 
-        if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
-                self.text_encoder.model.cpu()
+        if context_override is not None:
+            context = context_override
         else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+            if not self.t5_cpu:
+                self.text_encoder.model.to(self.device)
+                context = self.text_encoder([input_prompt], self.device)
+                if offload_model:
+                    self.text_encoder.model.cpu()
+            else:
+                context = self.text_encoder([input_prompt], torch.device('cpu'))
+                context = [t.to(self.device) for t in context]
+
+        if context_null_override is not None:
+            context_null = context_null_override
+        else:
+            if not self.t5_cpu:
+                self.text_encoder.model.to(self.device)
+                context_null = self.text_encoder([n_prompt], self.device)
+                if offload_model:
+                    self.text_encoder.model.cpu()
+            else:
+                context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+                context_null = [t.to(self.device) for t in context_null]
 
         noise = [
             torch.randn(
@@ -193,7 +226,30 @@ class WanT2V:
                 device=self.device,
                 generator=seed_g)
         ]
+        # initial noise sharing: previous segment tail -> current segment head
+        if prev_noise_tail_cache is not None:
+            prev_tail = prev_noise_tail_cache
 
+        # 如果外层传进来的是 list/tuple，就取第一个
+            if isinstance(prev_tail, (list, tuple)):
+                prev_tail = prev_tail[0]
+ 
+            prev_tail = prev_tail.to(
+                    device=noise[0].device,
+                    dtype=noise[0].dtype
+        )
+
+            current_overlap = min(
+                    noise_overlap,
+                    prev_tail.shape[1],
+                    noise[0].shape[1],
+        )
+
+            noise[0][:, :current_overlap, :, :] = prev_tail[:, -current_overlap:, :, :]
+        if return_noise_tail_cache:
+            noise_tail_cache = noise[0][:, -noise_overlap:, :, :].detach().cpu().clone()
+        else:
+            noise_tail_cache = None
         @contextmanager
         def noop_no_sync():
             yield
@@ -229,22 +285,115 @@ class WanT2V:
 
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
-
-            for _, t in enumerate(tqdm(timesteps)):
+            velocity_tail_cache = [] if return_velocity_cache else None
+            hidden_tail_cache = [] if return_hidden_tail_cache else None
+            num_steps = len(timesteps)
+            for step_idx, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
 
                 timestep = torch.stack(timestep)
 
                 self.model.to(self.device)
+                # ============================================================
+                # hidden state fusion/cache 只作用在 cond 分支
+                # ============================================================
+                use_hidden_fusion = (
+                    prev_hidden_tail_cache is not None
+                    and step_idx < int(num_steps * hidden_use_step_ratio)
+                    and step_idx < len(prev_hidden_tail_cache)
+                )
+
+                cur_hidden_cache = {} if return_hidden_tail_cache else None
+
+                if return_hidden_tail_cache or use_hidden_fusion:
+                    self.model.hidden_fusion_runtime = {
+                    "enabled": use_hidden_fusion,
+                    "return_cache": return_hidden_tail_cache,
+                    "prev_cache": (
+                     prev_hidden_tail_cache[step_idx]
+                     if use_hidden_fusion else None
+                    ),
+                    "cur_cache": cur_hidden_cache,
+                    "overlap": hidden_overlap,
+                    "alpha": hidden_alpha,
+                    "block_start": hidden_block_start,
+                    "block_end": hidden_block_end,
+                }
+                else:
+                    self.model.hidden_fusion_runtime = None
+                    
+                if step_idx == 0:
+                    print(
+        "[HiddenFusion Runtime]",
+        "prev_hidden_tail_cache is None =", prev_hidden_tail_cache is None,
+        "return_hidden_tail_cache =", return_hidden_tail_cache,
+        "use_hidden_fusion =", use_hidden_fusion,
+        "hidden_overlap =", hidden_overlap,
+        "hidden_alpha =", hidden_alpha,
+        "hidden_block_range =", hidden_block_start, hidden_block_end,
+    )
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
+                if return_hidden_tail_cache:
+                    hidden_tail_cache.append(cur_hidden_cache)
+
+                    if step_idx == 0:
+                        print(
+                        "[HiddenFusion AfterCond]",
+                        "cur_hidden_cache is None =", cur_hidden_cache is None,
+                        "num_saved_blocks =", len(cur_hidden_cache) if cur_hidden_cache is not None else None,
+                        "saved_keys =", list(cur_hidden_cache.keys())[:10] if cur_hidden_cache is not None else None,
+                        )
+
+                        if cur_hidden_cache is not None and len(cur_hidden_cache) > 0:
+                            first_key = sorted(cur_hidden_cache.keys())[0]
+                            print(
+                            "[HiddenFusion AfterCond Example]",
+                            "block =", first_key,
+                            "shape =", tuple(cur_hidden_cache[first_key].shape),
+                        )             
+                self.model.hidden_fusion_runtime = None
+   
                 noise_pred_uncond = self.model(
                     latent_model_input, t=timestep, **arg_null)[0]
 
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
+                if return_velocity_cache:
+                    velocity_tail_cache.append(
+                        noise_pred[:, -velocity_overlap:, :, :].detach().cpu().clone()
+                    )
+                
+                velocity_start_step = int(num_steps * velocity_start_step_ratio)
+                velocity_end_step = int(num_steps * velocity_end_step_ratio)
+                if prev_velocity_tail_cache is not None:
+                    if velocity_start_step <= step_idx < velocity_end_step and step_idx < len(prev_velocity_tail_cache):
+                        v_A = prev_velocity_tail_cache[step_idx].to(
+                        device=noise_pred.device,
+                        dtype=noise_pred.dtype
+                        )
 
+                        # 防止 overlap 超过当前 T
+                        current_overlap = min(
+                        velocity_overlap,
+                        v_A.shape[1],
+                        noise_pred.shape[1],
+                        )
+
+                        v_A = v_A[:, -current_overlap:, :, :]
+                        v_B = noise_pred[:, :current_overlap, :, :]
+
+                        # 视频时间维衰减：B 的第一个 latent-frame 继承强，后面逐渐减弱
+                        alpha_frame = torch.linspace(
+                        velocity_alpha_start,
+                        0.0,
+                        current_overlap,
+                        device=noise_pred.device,
+                        dtype=noise_pred.dtype
+                        ).view(1, current_overlap, 1, 1)
+
+                        noise_pred[:, :current_overlap, :, :] = (  alpha_frame * v_A + (1.0 - alpha_frame) * v_B  )
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
                     t,
@@ -252,7 +401,7 @@ class WanT2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
-
+                
             x0 = latents
             if offload_model:
                 self.model.cpu()
@@ -268,4 +417,7 @@ class WanT2V:
         if dist.is_initialized():
             dist.barrier()
 
-        return videos[0] if self.rank == 0 else None
+        video = videos[0] if self.rank == 0 else None
+        if hasattr(self.model, "hidden_fusion_runtime"):
+            self.model.hidden_fusion_runtime = None
+        return velocity_tail_cache,noise_tail_cache,hidden_tail_cache, video

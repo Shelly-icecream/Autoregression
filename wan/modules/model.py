@@ -104,14 +104,17 @@ class WanLayerNorm(nn.LayerNorm):
 
 class WanSelfAttention(nn.Module):
 
-    def __init__(self,
-                 dim,
-                 num_heads,
-                 window_size=(-1, -1),
-                 qk_norm=True,
-                 eps=1e-6):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        eps=1e-6,
+    ):
         assert dim % num_heads == 0
         super().__init__()
+
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -124,39 +127,272 @@ class WanSelfAttention(nn.Module):
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
-        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+        self.norm_q = (
+            WanRMSNorm(dim, eps=eps)
+            if qk_norm
+            else nn.Identity()
+        )
+        self.norm_k = (
+            WanRMSNorm(dim, eps=eps)
+            if qk_norm
+            else nn.Identity()
+        )
+
+    def forward(
+        self,
+        x,
+        seq_lens,
+        grid_sizes,
+        freqs,
+        frame_offset=0,
+        prev_kv_cache=None,
+        return_kv_cache=False,
+        cache_frames=0,
+        cache_query_frames=0,
+        cache_strength=0.0,
+    ):
         r"""
         Args:
-            x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            x:
+                Tensor，形状 [B, L, C]
+
+            seq_lens:
+                Tensor，形状 [B]，每个样本的有效 token 长度。
+
+            grid_sizes:
+                Tensor，形状 [B, 3]，每行为 (F, H, W)。
+
+            freqs:
+                RoPE 频率。
+
+            frame_offset:
+                当前分段在全局 latent 时间轴上的起始位置。
+
+                第一段通常为 0；
+                第二段通常为：
+                    latent_frames - latent_overlap
+
+            prev_kv_cache:
+                前一段相同去噪步、相同 Transformer block 的 KV：
+                {
+                    "k": [B, L_cache, num_heads, head_dim],
+                    "v": [B, L_cache, num_heads, head_dim],
+                    "lens": [B]
+                }
+
+                其中 k 已经应用过前一段对应的 RoPE。
+
+            return_kv_cache:
+                是否返回当前段尾部 KV。
+
+            cache_frames:
+                保存当前段最后多少个 latent 帧的 KV。
+
+            cache_query_frames:
+                当前段最前多少个 latent 帧可以读取前段 KV。
+
+            cache_strength:
+                KV cache 残差分支的强度。
         """
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        b, s = x.shape[:2]
+        n = self.num_heads
+        d = self.head_dim
 
-        # query, key, value function
-        def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
-            return q, k, v
+        # --------------------------------------------------
+        # 1. 当前段 Q、K、V
+        # --------------------------------------------------
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        k = self.norm_k(self.k(x)).view(b, s, n, d)
+        v = self.v(x).view(b, s, n, d)
 
-        q, k, v = qkv_fn(x)
+        # --------------------------------------------------
+        # 2. 应用带全局时间偏移的 RoPE
+        # --------------------------------------------------
+        q_rope = rope_apply(
+            q,
+            grid_sizes,
+            freqs,
+            frame_offset=frame_offset,
+        )
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
+        k_rope = rope_apply(
+            k,
+            grid_sizes,
+            freqs,
+            frame_offset=frame_offset,
+        )
+
+        # --------------------------------------------------
+        # 3. 当前段原始 self-attention
+        # --------------------------------------------------
+        current_out = flash_attention(
+            q=q_rope,
+            k=k_rope,
             v=v,
             k_lens=seq_lens,
-            window_size=self.window_size)
+            window_size=self.window_size,
+        )
 
-        # output
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
+        out = current_out
+
+        # --------------------------------------------------
+        # 4. 前段 KV cache 残差注意力
+        # --------------------------------------------------
+        use_prev_cache = (
+            prev_kv_cache is not None
+            and cache_strength > 0.0
+            and cache_query_frames > 0
+        )
+
+        if use_prev_cache:
+            cached_k = prev_kv_cache["k"].to(
+                device=q_rope.device,
+                dtype=q_rope.dtype,
+            )
+            cached_v = prev_kv_cache["v"].to(
+                device=v.device,
+                dtype=v.dtype,
+            )
+            cached_lens = prev_kv_cache["lens"].to(
+                device=seq_lens.device,
+                dtype=seq_lens.dtype,
+            )
+
+            # 第一版先要求同一 batch 的 F、H、W 相同。
+            if not torch.all(grid_sizes == grid_sizes[0]):
+                raise ValueError(
+                    "当前实现要求同一 batch 内所有样本具有相同的 "
+                    "(F, H, W)。"
+                )
+
+            f, h, w = [
+                int(value)
+                for value in grid_sizes[0].tolist()
+            ]
+
+            tokens_per_frame = h * w
+
+            # 只让当前段最前面的若干 latent 帧读取前段 cache。
+            query_token_num = min(
+                cache_query_frames * tokens_per_frame,
+                f * tokens_per_frame,
+                s,
+            )
+
+            if query_token_num > 0:
+                q_head = q_rope[:, :query_token_num]
+
+                cache_out_head = flash_attention(
+                    q=q_head,
+                    k=cached_k,
+                    v=cached_v,
+                    k_lens=cached_lens,
+
+                    # cache 中只有前段尾部 token，
+                    # 这里不再使用原本的局部窗口限制。
+                    window_size=(-1, -1),
+                )
+
+                # 只修改当前段头部 query 对应的输出。
+                cache_out = torch.zeros_like(current_out)
+                cache_out[:, :query_token_num] = cache_out_head
+
+                # 保留当前段自己的 attention，
+                # 前段 cache 只作为残差补充。
+                out = (
+                    current_out
+                    + cache_strength * cache_out
+                )
+
+        # --------------------------------------------------
+        # 5. 保存当前段尾部 KV
+        # --------------------------------------------------
+        new_kv_cache = None
+
+        if return_kv_cache and cache_frames > 0:
+            cached_k_list = []
+            cached_v_list = []
+            cached_lens_list = []
+
+            for batch_idx in range(b):
+                f, h, w = [
+                    int(value)
+                    for value
+                    in grid_sizes[batch_idx].tolist()
+                ]
+
+                tokens_per_frame = h * w
+
+                # 实际视频 token 数。
+                video_token_num = f * tokens_per_frame
+
+                # seq_lens 可能包含 padding 后的有效长度信息。
+                valid_len = min(
+                    int(seq_lens[batch_idx].item()),
+                    video_token_num,
+                    s,
+                )
+
+                cache_token_num = min(
+                    cache_frames * tokens_per_frame,
+                    valid_len,
+                )
+
+                start_idx = valid_len - cache_token_num
+                end_idx = valid_len
+
+                # 缓存已经应用过正确全局时间位置的 K。
+                cached_k_list.append(
+                    k_rope[
+                        batch_idx,
+                        start_idx:end_idx,
+                    ].detach().clone()
+                )
+
+                cached_v_list.append(
+                    v[
+                        batch_idx,
+                        start_idx:end_idx,
+                    ].detach().clone()
+                )
+
+                cached_lens_list.append(cache_token_num)
+
+            # 当前项目一般 batch 内视频尺寸一致。
+            # 若不同，则需要 padding cache。
+            if len(set(cached_lens_list)) != 1:
+                raise ValueError(
+                    "当前 batch 内不同样本的 KV cache 长度不同，"
+                    "需要为 cache 增加 padding。"
+                )
+
+            new_kv_cache = {
+                "k": torch.stack(
+                    cached_k_list,
+                    dim=0,
+                ),
+                "v": torch.stack(
+                    cached_v_list,
+                    dim=0,
+                ),
+                "lens": torch.tensor(
+                    cached_lens_list,
+                    device=seq_lens.device,
+                    dtype=seq_lens.dtype,
+                ),
+            }
+
+        # --------------------------------------------------
+        # 6. 输出映射
+        # --------------------------------------------------
+        out = out.flatten(2)
+        out = self.o(out)
+
+        if return_kv_cache:
+            return out, new_kv_cache
+
+        return out
 
 
 class WanT2VCrossAttention(WanSelfAttention):
@@ -274,7 +510,109 @@ class WanAttentionBlock(nn.Module):
 
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+    def _get_hidden_fusion_runtime(self):
+        runtime = getattr(self, "hidden_fusion_runtime", None)
+        block_idx = getattr(self, "hidden_fusion_block_idx", -1)
+        return runtime, block_idx
 
+    def _hidden_tail_head_fusion_and_cache(self, y, grid_sizes):
+        """
+        对 self-attention 输出 y 做跨段 hidden state 融合，并保存当前段尾部 hidden state。
+
+        y: [B, L, C]
+        grid_sizes: [B, 3], 每一行是 (F, H, W)
+        """
+        runtime, block_idx = self._get_hidden_fusion_runtime()
+
+        if runtime is None:
+            return y
+
+        block_start = runtime.get("block_start", 0)
+        block_end = runtime.get("block_end", 10**9)
+        # debug: 只打印 block_start 这一层，避免刷屏
+        debug = runtime.get("debug", False)
+        if debug and block_idx == block_start:
+            print(
+                f"[HF-Block-Enter] block={block_idx}, "
+                f"enabled={runtime.get('enabled', False)}, "
+                f"return_cache={runtime.get('return_cache', False)}, "
+                f"prev_cache_none={runtime.get('prev_cache', None) is None}, "
+                f"cur_cache_none={runtime.get('cur_cache', None) is None}, "
+                f"alpha={runtime.get('alpha', None)}, "
+                f"overlap={runtime.get('overlap', None)}, "
+                f"block_range=({block_start},{block_end})"
+            )
+        # 只在指定 block 范围内做
+        if not (block_start <= block_idx < block_end):
+            return y
+
+        # 当前先只支持单视频 B=1，和你的生成流程一致
+        if y.shape[0] != 1:
+            return y
+
+        f, h, w = grid_sizes[0].tolist()
+        f = int(f)
+        h = int(h)
+        w = int(w)
+
+        S = h * w
+        overlap = int(runtime.get("overlap", 2))
+        current_overlap = min(overlap, f)
+
+        hidden_tokens = current_overlap * S
+        if debug and block_idx == block_start:
+            print(
+                f"[HF-Shape] block={block_idx}, "
+                f"y={tuple(y.shape)}, "
+                f"grid=(f={f}, h={h}, w={w}), "
+                f"S={S}, current_overlap={current_overlap}, "
+                f"hidden_tokens={hidden_tokens}"
+            )
+
+        if hidden_tokens <= 0 or hidden_tokens > y.shape[1]:
+            return y
+
+        # ============================================================
+        # 1. 用上一段 hidden tail 融合当前段 hidden head
+        # ============================================================
+        enabled = runtime.get("enabled", False)
+        prev_cache = runtime.get("prev_cache", None)
+        alpha = float(runtime.get("alpha", 0.03))
+
+        if enabled and prev_cache is not None and alpha > 0:
+            prev_tail = None
+
+            if isinstance(prev_cache, dict):
+                prev_tail = prev_cache.get(block_idx, None)
+            elif isinstance(prev_cache, (list, tuple)):
+                if block_idx < len(prev_cache):
+                    prev_tail = prev_cache[block_idx]
+
+            if prev_tail is not None:
+                prev_tail = prev_tail.to(device=y.device, dtype=y.dtype)
+
+                if prev_tail.ndim == 3:
+                    use_tokens = min(hidden_tokens, prev_tail.shape[1], y.shape[1])
+
+                    if use_tokens > 0:
+                        # 避免原地修改导致 autograd / amp 下潜在问题
+                        y = y.clone()
+                        y[:, :use_tokens, :] = (
+                            (1.0 - alpha) * y[:, :use_tokens, :]
+                            + alpha * prev_tail[:, -use_tokens:, :]
+                        )
+
+        # ============================================================
+        # 2. 保存当前段尾部 hidden state，供下一段使用
+        # ============================================================
+        if runtime.get("return_cache", False):
+            cur_cache = runtime.get("cur_cache", None)
+            if cur_cache is not None:
+                cur_cache[block_idx] = (
+                    y[:, -hidden_tokens:, :].detach().cpu().clone()
+                )
+
+        return y
     def forward(
         self,
         x,
@@ -302,6 +640,9 @@ class WanAttentionBlock(nn.Module):
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
             freqs)
+        # hidden state fusion:
+        # 上一段尾部 self-attn hidden state -> 当前段头部 self-attn hidden state
+        y = self._hidden_tail_head_fusion_and_cache(y, grid_sizes)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
@@ -570,8 +911,10 @@ class WanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens)
-
-        for block in self.blocks:
+        hidden_fusion_runtime = getattr(self, "hidden_fusion_runtime", None)
+        for block_idx,block in enumerate(self.blocks):
+            block.hidden_fusion_runtime = hidden_fusion_runtime
+            block.hidden_fusion_block_idx = block_idx
             x = block(x, **kwargs)
 
         # head
