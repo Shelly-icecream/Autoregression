@@ -52,7 +52,6 @@ def _parse_args():
         default=None,
         help="Whether to offload the model to CPU after each model forward, reducing GPU memory usage."
     )
-    
     parser.add_argument(
         "--ulysses_size",
         type=int,
@@ -238,6 +237,77 @@ def _parse_args():
     type=int,
     default=20,
     help="End block index, exclusive, for hidden state fusion."
+)
+    parser.add_argument(
+        "--use_kv_cache",
+        action="store_true",
+        help="Use cross-segment self-attention KV cache from previous segment tail to current segment head."
+    )
+
+    parser.add_argument(
+        "--kv_cache_frames",
+        type=int,
+        default=2,
+        help="Number of latent tail frames saved as KV cache."
+    )
+
+    parser.add_argument(
+        "--kv_cache_query_frames",
+        type=int,
+        default=2,
+        help="Number of latent head frames allowed to read previous KV cache."
+    )
+
+    parser.add_argument(
+        "--kv_cache_strength",
+        type=float,
+        default=0.05,
+        help="Residual strength for previous-segment KV cache attention."
+    )
+
+    parser.add_argument(
+        "--kv_cache_use_start_ratio",
+        type=float,
+        default=0.45,
+        help="Use KV cache only in the first ratio of denoising steps."
+    )
+
+    parser.add_argument(
+        "--kv_cache_use_end_ratio",
+        type=float,
+        default=0.75,
+        help="Stop using KV cache after this ratio of denoising steps."
+    )
+    parser.add_argument(
+    "--kv_block_start",
+    type=int,
+    default=12,
+    help="Start block index, inclusive, for KV cache."
+)
+
+    parser.add_argument(
+    "--kv_block_end",
+    type=int,
+    default=16,
+    help="End block index, exclusive, for KV cache."
+)
+
+    parser.add_argument(
+        "--disable_hidden_state_fusion",
+        action="store_true",
+        help="Disable hidden state fusion when testing KV cache."
+    )
+    parser.add_argument(
+        "--use_sink_kv_cache",
+        action="store_true",
+        default=False,
+        help="Use first-segment head KV as long-term Sink together with previous tail KV."
+    )
+    parser.add_argument(
+    "--latent_overlap",
+    type=int,
+    default=0,
+    help="Number of overlapping latent frames between adjacent segments for global RoPE frame offset.",
 )
     args = parser.parse_args()
 
@@ -509,9 +579,6 @@ def generate(args):
     device = local_rank
     _init_logging(rank)
 
-    # ============================================================
-    # 1. 基础初始化
-    # ============================================================
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
         logging.info(
@@ -556,9 +623,8 @@ def generate(args):
             ulysses_degree=args.ulysses_size,
         )
 
-    # ============================================================
-    # 2. prompt extend，保留原逻辑
-    # ============================================================
+    
+    # 2. prompt extend
     if args.use_prompt_extend:
         if args.prompt_extend_method == "dashscope":
             prompt_expander = DashScopePromptExpander(
@@ -591,9 +657,8 @@ def generate(args):
         dist.broadcast_object_list(base_seed, src=0)
         args.base_seed = base_seed[0]
 
-    # ============================================================
+    
     # 3. 只处理 t2v
-    # ============================================================
     if "t2v" not in args.task:
         raise ValueError(f"Unknown task type: {args.task}")
 
@@ -629,9 +694,8 @@ def generate(args):
         args.prompt = input_prompt[0]
         logging.info(f"Extended prompt: {args.prompt}")
 
-    # ============================================================
+  
     # 4. 创建 WanT2V
-    # ============================================================
     logging.info("Creating WanT2V pipeline.")
 
     wan_t2v = wan.WanT2V(
@@ -645,10 +709,8 @@ def generate(args):
         t5_cpu=args.t5_cpu,
     )
 
-    # ============================================================
-    # 5. 构造 prompt/context 列表
-    #    保留 prompt/context 线性插值
-    # ============================================================
+   
+    # 5. 构造 prompt/context 列表,保留 prompt/context 线性插值
     logging.info("Encoding negative context ...")
     context_null = encode_negative_context(wan_t2v, NEGATIVE_PROMPT)
 
@@ -662,32 +724,40 @@ def generate(args):
 
     logging.info(f"Total generation items: {len(context_items)}")
 
-    # ============================================================
-    # 6. 多段生成状态
-    # 现在保存的是 decoded video
-    # ============================================================
     final_video = None
     prev_velocity_tail_cache = None
     prev_noise_tail_cache = None
     prev_hidden_tail_cache = None
-
-    use_velocity_interp = getattr(args, "use_velocity_interp", True)
-    velocity_overlap = getattr(args, "velocity_overlap", 4)
+    prev_kv_cache_cond = None
+    sink_kv_cache_cond = None
+    
+    use_velocity_interp = getattr(args, "use_velocity_interp", False)
     velocity_alpha_start = getattr(args, "velocity_alpha_start", 0.4)
     velocity_start_step_ratio = getattr(args, "velocity_start_step_ratio", 0.6)
     velocity_end_step_ratio = getattr(args, "velocity_end_step_ratio", 0.9)
+    velocity_overlap = getattr(args, "velocity_overlap", 2)
 
     hidden_overlap = getattr(args, "hidden_overlap", 2)
     hidden_alpha = getattr(args, "hidden_alpha", 0.03)
     hidden_use_step_ratio = getattr(args, "hidden_use_step_ratio", 0.4)
     hidden_block_start = getattr(args, "hidden_block_start", 8)
     hidden_block_end = getattr(args, "hidden_block_end", 20)
+    enable_hidden_state_fusion = getattr(args, "disable_hidden_state_fusion", False)
     
     noise_overlap = getattr(args, "noise_overlap", 4)
+    latent_overlap = getattr(args, "latent_overlap", 0)
+    use_kv_cache = getattr(args, "use_kv_cache", False)
+    use_sink_kv_cache = getattr(args, "use_sink_kv_cache", False)
+    kv_cache_frames = getattr(args, "kv_cache_frames", 2)
+    kv_cache_query_frames = getattr(args, "kv_cache_query_frames", 2)
+    kv_cache_strength = getattr(args, "kv_cache_strength", 0.05)
+    kv_cache_use_start_ratio = getattr(args, "kv_cache_use_start_ratio", 0.45)
+    kv_cache_use_end_ratio = getattr(args, "kv_cache_use_end_ratio", 0.75)
+    kv_block_start = getattr(args, "kv_block_start", 12)
+    kv_block_end = getattr(args, "kv_block_end", 16)
 
-    # ============================================================
+   
     # 7. 逐段生成
-    # ============================================================
     for idx, item in enumerate(context_items):
         logging.info("=" * 80)
         logging.info(f"[Generate segment {idx + 1}/{len(context_items)}] {item['name']}")
@@ -702,14 +772,42 @@ def generate(args):
         logging.info(f"Seed: {item['seed']}")
         logging.info(f"Frame num: {item['frame_num']}")
 
-        # ------------------------------------------------------------
-        # 现在 WanT2V.generate 返回：
-        #   velocity_tail_cache, latent_tail_cache, cur_video
-        #
-        # cur_video.shape 预计是：
-        #   [C, T, H, W]
-        # ------------------------------------------------------------
-        velocity_tail_cache, noise_tail_cache,hidden_tail_cache, cur_video = wan_t2v.generate(
+        latent_frames = (item["frame_num"] - 1) // wan_t2v.vae_stride[0] + 1
+        if use_kv_cache:
+            latent_frame_offset = idx * (latent_frames - latent_overlap)
+        else:
+            latent_overlap = 0
+            latent_frame_offset = 0
+        logging.info(
+            f"[KVCache] use_kv_cache={use_kv_cache}, "
+            f"use_sink_kv_cache={use_sink_kv_cache}, "
+            f"latent_frames={latent_frames}, "
+            f"latent_overlap={latent_overlap}, "
+            f"latent_frame_offset={latent_frame_offset}, "
+            f"kv_cache_frames={kv_cache_frames}, "
+            f"kv_cache_query_frames={kv_cache_query_frames}, "
+            f"kv_cache_strength={kv_cache_strength}, "
+            f"kv_cache_use_start_ratio={kv_cache_use_start_ratio}, "
+            f"kv_cache_use_end_ratio={kv_cache_use_end_ratio}, "
+            f"kv_block_start={kv_block_start}, "
+            f"kv_block_end={kv_block_end}, "
+            f"enable_hidden_state_fusion={enable_hidden_state_fusion}"
+        )
+        return_head_kv_cache = (use_kv_cache and use_sink_kv_cache and idx == 0)
+
+        active_sink_kv_cache_cond = (
+            sink_kv_cache_cond
+            if (use_kv_cache and use_sink_kv_cache and idx >= 1)
+            else None
+        )
+        logging.info(
+    f"[SinkKV Active] idx={idx}, "
+    f"return_head_kv_cache={return_head_kv_cache}, "
+    f"active_sink_is_none={active_sink_kv_cache_cond is None}, "
+    f"sink_kv_cache_cond_is_none={sink_kv_cache_cond is None}, "
+    f"prev_kv_is_none={prev_kv_cache_cond is None}"
+)
+        (velocity_tail_cache,noise_tail_cache,hidden_tail_cache,kv_cache_cond,cur_video,) = wan_t2v.generate(
             input_prompt="",
             size=SIZE_CONFIGS[args.size],
             frame_num=item["frame_num"],
@@ -735,30 +833,79 @@ def generate(args):
             velocity_end_step_ratio=velocity_end_step_ratio,
            
             # noise 共享
-            return_noise_tail_cache=True,
-            prev_noise_tail_cache=prev_noise_tail_cache,
+            return_noise_tail_cache=(noise_overlap > 0),
+            prev_noise_tail_cache=(prev_noise_tail_cache if noise_overlap > 0 else None),
             noise_overlap=noise_overlap,
             
             # hidden state fusion
-            return_hidden_tail_cache=True,
-            prev_hidden_tail_cache=prev_hidden_tail_cache,
             hidden_overlap=hidden_overlap,
             hidden_alpha=hidden_alpha,
             hidden_use_step_ratio=hidden_use_step_ratio,
             hidden_block_start=hidden_block_start,
             hidden_block_end=hidden_block_end,
+            
+            # KV cache
+            sink_kv_cache_cond=active_sink_kv_cache_cond,
+            return_head_kv_cache=return_head_kv_cache,
+            prev_kv_cache_cond=(
+                prev_kv_cache_cond if use_kv_cache else None
+            ),
+            return_kv_cache=use_kv_cache,
+            kv_cache_frames=kv_cache_frames,
+            kv_cache_query_frames=kv_cache_query_frames,
+            kv_cache_strength=kv_cache_strength,
+            kv_cache_use_start_ratio=kv_cache_use_start_ratio,
+            kv_cache_use_end_ratio=kv_cache_use_end_ratio,
+            kv_block_start=kv_block_start,
+            kv_block_end=kv_block_end,
+            latent_frame_offset=latent_frame_offset,
+
+            enable_hidden_state_fusion=enable_hidden_state_fusion,
+            return_hidden_tail_cache=enable_hidden_state_fusion,
+            prev_hidden_tail_cache=(prev_hidden_tail_cache if enable_hidden_state_fusion else None),
         )
 
-      
         if use_velocity_interp:
             prev_velocity_tail_cache = velocity_tail_cache
         else:
             prev_velocity_tail_cache = None
+
         prev_noise_tail_cache = noise_tail_cache
-        prev_hidden_tail_cache = hidden_tail_cache
-        # ------------------------------------------------------------
-        # 非 rank0 不负责保存视频
-        # ------------------------------------------------------------
+
+        if enable_hidden_state_fusion:
+            prev_hidden_tail_cache = hidden_tail_cache
+        else:
+            prev_hidden_tail_cache = None
+
+        if use_kv_cache:
+            if (use_sink_kv_cache and idx == 0 and kv_cache_cond is not None):
+                sink_kv_cache_cond = {}
+
+                for step_idx, step_cache in enumerate(kv_cache_cond):
+                    if step_cache is None:
+                        sink_kv_cache_cond[step_idx] = None
+                        continue
+
+                    sink_step_cache = {}
+
+                    for block_idx, block_cache in step_cache.items():
+                        if ("head_k" in block_cache and "head_v" in block_cache and "head_lens" in block_cache):
+                            sink_step_cache[block_idx] = {
+                                "k": block_cache["head_k"],
+                                "v": block_cache["head_v"],
+                                "lens": block_cache["head_lens"],
+                            }
+
+                    sink_kv_cache_cond[step_idx] = (sink_step_cache if len(sink_step_cache) > 0 else None)
+
+                    logging.info("[KVCache] Saved first-segment head KV as Sink cache.")
+
+            prev_kv_cache_cond = kv_cache_cond
+        else:
+            prev_kv_cache_cond = None
+            sink_kv_cache_cond = None
+            prev_kv_cache_uncond = None
+        
         if rank != 0:
             continue
 
@@ -767,16 +914,6 @@ def generate(args):
 
         logging.info(f"[Video] current video shape = {tuple(cur_video.shape)}")
 
-        # ------------------------------------------------------------
-        # 直接拼 decoded video
-        #
-        # 一般 Wan VAE decode 出来是 [C, T, H, W]
-        # 所以沿 dim=1 拼接。
-        #
-        # 注意：
-        # 不再做 latent blend
-        # 不再做 append_latent_with_overlap
-        # ------------------------------------------------------------
         if final_video is None:
             final_video = cur_video
         else:

@@ -142,6 +142,20 @@ class WanT2V:
                  hidden_use_step_ratio=0.4,
                  hidden_block_start=8,
                  hidden_block_end=20,
+                 
+                 return_kv_cache=False,
+                 return_head_kv_cache=False,
+                 prev_kv_cache_cond=None,
+                 sink_kv_cache_cond=None,
+                 kv_cache_frames=2,
+                 kv_cache_query_frames=2,
+                 kv_cache_strength=0.08,
+                 kv_cache_use_start_ratio=0.45,
+                 kv_cache_use_end_ratio=0.75,
+                 latent_frame_offset=0,
+                 enable_hidden_state_fusion=True,
+                 kv_block_start=12,
+                 kv_block_end=16,
                  ):
         r"""
         Generates video frames from text prompt using diffusion process.
@@ -227,7 +241,7 @@ class WanT2V:
                 generator=seed_g)
         ]
         # initial noise sharing: previous segment tail -> current segment head
-        if prev_noise_tail_cache is not None:
+        if prev_noise_tail_cache is not None and noise_overlap > 0:
             prev_tail = prev_noise_tail_cache
 
         # 如果外层传进来的是 list/tuple，就取第一个
@@ -244,9 +258,9 @@ class WanT2V:
                     prev_tail.shape[1],
                     noise[0].shape[1],
         )
-
-            noise[0][:, :current_overlap, :, :] = prev_tail[:, -current_overlap:, :, :]
-        if return_noise_tail_cache:
+            if current_overlap > 0:
+                noise[0][:, :current_overlap, :, :] = prev_tail[:, -current_overlap:, :, :]
+        if return_noise_tail_cache and noise_overlap > 0:
             noise_tail_cache = noise[0][:, -noise_overlap:, :, :].detach().cpu().clone()
         else:
             noise_tail_cache = None
@@ -287,6 +301,10 @@ class WanT2V:
             arg_null = {'context': context_null, 'seq_len': seq_len}
             velocity_tail_cache = [] if return_velocity_cache else None
             hidden_tail_cache = [] if return_hidden_tail_cache else None
+            
+            kv_cache_cond = [] if return_kv_cache else None
+            
+            
             num_steps = len(timesteps)
             for step_idx, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
@@ -295,11 +313,36 @@ class WanT2V:
                 timestep = torch.stack(timestep)
 
                 self.model.to(self.device)
+                kv_cache_start_step = int(num_steps * kv_cache_use_start_ratio)
+                kv_cache_end_step = int(num_steps * kv_cache_use_end_ratio)
+
+                use_kv_cache = (
+                    prev_kv_cache_cond is not None
+                    and kv_cache_start_step <= step_idx < kv_cache_end_step
+                    and step_idx < len(prev_kv_cache_cond)
+                    and prev_kv_cache_cond[step_idx] is not None
+                )   
+
+                prev_step_kv_cond = (prev_kv_cache_cond[step_idx]if use_kv_cache else None)
+                use_sink_kv_cache = (
+                    sink_kv_cache_cond is not None
+                    and kv_cache_start_step <= step_idx < kv_cache_end_step
+                    and step_idx < len(sink_kv_cache_cond)
+                    and sink_kv_cache_cond[step_idx] is not None
+                )
+
+                sink_step_kv_cond = (sink_kv_cache_cond[step_idx]if use_sink_kv_cache else None)
+
+                use_any_kv_cache = use_kv_cache or use_sink_kv_cache
+               
+                cur_kv_cond = None
+                
                 # ============================================================
                 # hidden state fusion/cache 只作用在 cond 分支
                 # ============================================================
                 use_hidden_fusion = (
-                    prev_hidden_tail_cache is not None
+                    enable_hidden_state_fusion
+                    and prev_hidden_tail_cache is not None
                     and step_idx < int(num_steps * hidden_use_step_ratio)
                     and step_idx < len(prev_hidden_tail_cache)
                 )
@@ -325,16 +368,63 @@ class WanT2V:
                     
                 if step_idx == 0:
                     print(
-        "[HiddenFusion Runtime]",
-        "prev_hidden_tail_cache is None =", prev_hidden_tail_cache is None,
-        "return_hidden_tail_cache =", return_hidden_tail_cache,
-        "use_hidden_fusion =", use_hidden_fusion,
-        "hidden_overlap =", hidden_overlap,
-        "hidden_alpha =", hidden_alpha,
-        "hidden_block_range =", hidden_block_start, hidden_block_end,
+                    "[HiddenFusion Runtime]",
+                    "prev_hidden_tail_cache is None =", prev_hidden_tail_cache is None,
+                    "return_hidden_tail_cache =", return_hidden_tail_cache,
+                    "use_hidden_fusion =", use_hidden_fusion,
+                    "hidden_overlap =", hidden_overlap,
+                    "hidden_alpha =", hidden_alpha,
+                    "hidden_block_range =", hidden_block_start, hidden_block_end,
+                )
+                
+                should_return_kv_cache = (return_kv_cache and kv_cache_start_step <= step_idx < kv_cache_end_step)
+                if should_return_kv_cache:
+                    noise_pred_cond_list, cur_kv_cond = self.model(
+                        latent_model_input,
+                        t=timestep,
+                        **arg_c,
+                        frame_offset=latent_frame_offset,
+                        prev_kv_cache=prev_step_kv_cond,
+                        sink_kv_cache=sink_step_kv_cond,
+                        return_kv_cache=True,
+                        return_head_kv_cache=return_head_kv_cache,
+                        cache_frames=kv_cache_frames,
+                        cache_query_frames=(kv_cache_query_frames if use_kv_cache else 0),
+                        cache_strength=(kv_cache_strength if use_kv_cache else 0.0),
+                        enable_hidden_state_fusion=enable_hidden_state_fusion,
+                        kv_block_start=kv_block_start,
+                        kv_block_end=kv_block_end,
+                    )
+                    noise_pred_cond = noise_pred_cond_list[0]
+                else:
+                    noise_pred_cond = self.model(
+                        latent_model_input,
+                        t=timestep,
+                        **arg_c,
+                        frame_offset=latent_frame_offset,
+                        return_kv_cache=False,
+                        enable_hidden_state_fusion=enable_hidden_state_fusion,
+                    )[0]
+                if return_kv_cache and step_idx in [
+                    kv_cache_start_step,
+                    kv_cache_start_step + 1,
+                    kv_cache_end_step - 1,
+]:
+                    print(
+        "[KVCache StepCheck]",
+        "step_idx =", step_idx,
+        "start =", kv_cache_start_step,
+        "end =", kv_cache_end_step,
+        "prev_kv_cache_cond is None =", prev_kv_cache_cond is None,
+        "use_kv_cache =", use_kv_cache,
+        "should_return_kv_cache =", should_return_kv_cache,
+        "prev_step_kv_cond is None =", prev_step_kv_cond is None,
+        "prev_step_blocks =",
+        (
+            sorted(list(prev_step_kv_cond.keys()))
+            if prev_step_kv_cond is not None else None
+        ),
     )
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
                 if return_hidden_tail_cache:
                     hidden_tail_cache.append(cur_hidden_cache)
 
@@ -355,9 +445,43 @@ class WanT2V:
                         )             
                 self.model.hidden_fusion_runtime = None
    
+                
                 noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+        latent_model_input,
+        t=timestep,
+        **arg_null,
+        frame_offset=latent_frame_offset,
+        return_kv_cache=False,
+        enable_hidden_state_fusion=False,
+    )[0]                
+                if return_kv_cache:
+                    kv_cache_cond.append(cur_kv_cond)
+                if return_kv_cache and step_idx in [
+    kv_cache_start_step,
+    kv_cache_start_step + 1,
+    kv_cache_end_step - 1,
+]:
+                    print(
+        "[KVCache SaveCheck]",
+        "step_idx =", step_idx,
+        "cur_kv_cond is None =", cur_kv_cond is None,
+                        "saved_blocks =",
+        (sorted(list(cur_kv_cond.keys())) if cur_kv_cond is not None else None ),
+    )
 
+                    if cur_kv_cond is not None and len(cur_kv_cond) > 0:
+                        first_block = sorted(list(cur_kv_cond.keys()))[0]
+                        print(
+            "[KVCache SaveExample]",
+            "block =", first_block,
+            "k_shape =", tuple(cur_kv_cond[first_block]["k"].shape),
+            "v_shape =", tuple(cur_kv_cond[first_block]["v"].shape),
+            "lens =", cur_kv_cond[first_block]["lens"],
+            "k_device =", cur_kv_cond[first_block]["k"].device,
+            "v_device =", cur_kv_cond[first_block]["v"].device,
+            "k_dtype =", cur_kv_cond[first_block]["k"].dtype,
+            "v_dtype =", cur_kv_cond[first_block]["v"].dtype,
+        )
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
                 if return_velocity_cache:
@@ -420,4 +544,10 @@ class WanT2V:
         video = videos[0] if self.rank == 0 else None
         if hasattr(self.model, "hidden_fusion_runtime"):
             self.model.hidden_fusion_runtime = None
-        return velocity_tail_cache,noise_tail_cache,hidden_tail_cache, video
+        return (
+    velocity_tail_cache,
+    noise_tail_cache,
+    hidden_tail_cache,
+    kv_cache_cond,
+    video,
+)
