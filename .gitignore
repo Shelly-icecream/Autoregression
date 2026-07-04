@@ -1,38 +1,104 @@
-.*
+```gitignore
+# Python
+__pycache__/
 *.py[cod]
-# *.jpg
-*.jpeg
-# *.png
-*.gif
-*.bmp
-*.mp4
-*.mov
-*.mkv
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+conda-meta/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
 *.log
-*.zip
+logs/
+wandb/
+tensorboard/
+events.out.tfevents*
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Model checkpoints and weights
+ckpts/
+checkpoints/
+models/
+weights/
+pretrained/
+*.ckpt
 *.pt
 *.pth
-*.ckpt
 *.safetensors
-*.json
-# *.txt
-*.backup
-*.pkl
-*.html
-*.pdf
-*.whl
-cache
-__pycache__/
-storage/
+*.onnx
+
+# Generated media
+outputs/
+output/
+results/
+result/
 samples/
-!.gitignore
-!requirements.txt
-.DS_Store
-*DS_Store
-google/
-Wan2.1-T2V-14B/
-Wan2.1-T2V-1.3B/
-Wan2.1-I2V-14B-480P/
-Wan2.1-I2V-14B-720P/
-poetry.lock*.deb
+videos/
+generated/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.gif
+
+# Runtime caches
+.cache/
+cache/
+tmp/
+temp/
+latents/
+noise_cache/
+kv_cache/
+text_cache/
+initial_state_cache/
+
+# Dataset files
+data/
+datasets/
+*.tar
+*.tar.gz
+*.zip
+*.7z
+*.rar
+
+# Distributed / acceleration artifacts
+accelerate_config.yaml
+deepspeed_config*.json
+core.*
+
+# Local secrets
+.env
+.env.*
+*.key
+*.pem
+
+
+
+# CUDA installers
+*.deb
 *.run
+
+# Local downloaded model directory
+Wan2.1-T2V-1.3B/
+```

@@ -25,13 +25,13 @@ def _parse_args():
     parser.add_argument(
         "--task",
         type=str,
-        default="t2v-14B",
+        default="t2v-1.3B",
         choices=list(WAN_CONFIGS.keys()),
         help="The task to run.")
     parser.add_argument(
         "--size",
         type=str,
-        default="1280*720",
+        default="832*480",
         choices=list(SIZE_CONFIGS.keys()),
         help="The area (width*height) of the generated video. For the I2V task, the aspect ratio of the output video will follow that of the input image."
     )
@@ -166,77 +166,69 @@ def _parse_args():
         default=5.0,
         help="Classifier free guidance scale.")
     parser.add_argument(
-    "--use_velocity_interp",
-    action="store_true",
-    help="Use tail velocity cache from previous segment to guide the head of the next segment."
-)
-
-    parser.add_argument(
-    "--velocity_overlap",
-    type=int,
-    default=4,
-    help="Number of latent-frame positions used for velocity interpolation."
-)
-
-    parser.add_argument(
-    "--velocity_alpha_start",
-    type=float,
-    default=1.0,
-    help="Initial alpha for velocity interpolation."
-)
-
-    parser.add_argument(
-    "--velocity_start_step_ratio",
-    type=float,
-    default=0.6,
-    help="Use velocity interpolation in the first ratio of denoising steps."
-)
-    parser.add_argument(
-    "--velocity_end_step_ratio",
-    type=float,
-    default=0.9,
-    help="Stop using velocity interpolation after this ratio of denoising steps."
-)
-    
-    parser.add_argument(
-    "--noise_overlap",
-    type=int,
-    default=4,
-    help="Number of latent frames whose initial noise is shared from previous segment tail to current segment head."
+        "--use_velocity_interp",
+        action="store_true",
+        help="Use tail velocity cache from previous segment to guide the head of the next segment."
     )
     parser.add_argument(
-    "--hidden_overlap",
-    type=int,
-    default=2,
-    help="Number of latent time steps for hidden state tail-head fusion."
-)
-
+        "--velocity_overlap",
+        type=int,
+        default=2,
+        help="Number of latent-frame positions used for velocity interpolation."
+    )
     parser.add_argument(
-    "--hidden_alpha",
-    type=float,
-    default=0.03,
-    help="Fusion alpha for hidden state tail-head fusion."
+        "--velocity_alpha_start",
+        type=float,
+        default=1.0,
+        help="Initial alpha for velocity interpolation."
 )
-
     parser.add_argument(
-    "--hidden_use_step_ratio",
-    type=float,
-    default=0.4,
-    help="Use hidden state fusion in the first ratio of denoising steps."
+        "--velocity_start_step_ratio",
+        type=float,
+        default=0,
+        help="Use velocity interpolation in the first ratio of denoising steps."
 )
-
     parser.add_argument(
-    "--hidden_block_start",
-    type=int,
-    default=8,
-    help="Start block index for hidden state fusion."
+        "--velocity_end_step_ratio",
+        type=float,
+        default=0.35,
+        help="Stop using velocity interpolation after this ratio of denoising steps."
 )
-
     parser.add_argument(
-    "--hidden_block_end",
-    type=int,
-    default=20,
-    help="End block index, exclusive, for hidden state fusion."
+        "--noise_overlap",
+        type=int,
+        default=4,
+        help="Number of latent frames whose initial noise is shared from previous segment tail to current segment head."
+    )
+    parser.add_argument(
+        "--hidden_overlap",
+        type=int,
+        default=2,
+        help="Number of latent time steps for hidden state tail-head fusion."
+)
+    parser.add_argument(
+        "--hidden_alpha",
+        type=float,
+        default=0.03,
+        help="Fusion alpha for hidden state tail-head fusion."
+)
+    parser.add_argument(
+        "--hidden_use_step_ratio",
+        type=float,
+        default=0.4,
+        help="Use hidden state fusion in the first ratio of denoising steps."
+)
+    parser.add_argument(
+        "--hidden_block_start",
+        type=int,
+        default=8,
+        help="Start block index for hidden state fusion."
+)
+    parser.add_argument(
+        "--hidden_block_end",
+        type=int,
+        default=20,
+        help="End block index, exclusive, for hidden state fusion."
 )
     parser.add_argument(
         "--use_kv_cache",
@@ -261,37 +253,36 @@ def _parse_args():
     parser.add_argument(
         "--kv_cache_strength",
         type=float,
-        default=0.05,
+        default=2,
         help="Residual strength for previous-segment KV cache attention."
     )
 
     parser.add_argument(
         "--kv_cache_use_start_ratio",
         type=float,
-        default=0.45,
+        default=0.01,
         help="Use KV cache only in the first ratio of denoising steps."
     )
 
     parser.add_argument(
         "--kv_cache_use_end_ratio",
         type=float,
-        default=0.75,
+        default=0.31,
         help="Stop using KV cache after this ratio of denoising steps."
     )
     parser.add_argument(
-    "--kv_block_start",
-    type=int,
-    default=12,
-    help="Start block index, inclusive, for KV cache."
-)
+        "--kv_block_start",
+        type=int,
+        default=14,
+        help="Start block index, inclusive, for KV cache."
+    )
 
     parser.add_argument(
-    "--kv_block_end",
-    type=int,
-    default=16,
-    help="End block index, exclusive, for KV cache."
+        "--kv_block_end",
+        type=int,
+        default=18,
+        help="End block index, exclusive, for KV cache."
 )
-
     parser.add_argument(
         "--disable_hidden_state_fusion",
         action="store_true",
@@ -304,11 +295,50 @@ def _parse_args():
         help="Use first-segment head KV as long-term Sink together with previous tail KV."
     )
     parser.add_argument(
-    "--latent_overlap",
-    type=int,
-    default=0,
-    help="Number of overlapping latent frames between adjacent segments for global RoPE frame offset.",
+        "--latent_overlap",
+        type=int,
+        default=0,
+        help="Number of overlapping latent frames between adjacent segments for global RoPE frame offset.",
+    )
+    
+    
+    parser.add_argument(
+        "--use_latent_blend",
+        action="store_true",
+        help="Blend previous segment tail latents into current segment head latents at matching denoising steps."
+    )
+    parser.add_argument(
+        "--latent_blend_overlap",
+        type=int,
+        default=2,
+        help="Number of latent frames for tail-head latent blending."
 )
+    parser.add_argument(
+        "--latent_blend_alpha_start",
+        type=float,
+        default=0.8,
+        help="Alpha for the first blended head latent frame."
+)
+
+    parser.add_argument(
+        "--latent_blend_alpha_end",
+        type=float,
+        default=0.2,
+        help="Alpha for the last blended head latent frame."
+)
+    parser.add_argument(
+        "--latent_blend_start_step_ratio",
+        type=float,
+        default=0.35,
+        help="Start denoising ratio for latent blending."
+)
+    parser.add_argument(
+        "--latent_blend_end_step_ratio",
+        type=float,
+        default=0.65,
+        help="End denoising ratio for latent blending."
+)
+    
     args = parser.parse_args()
 
     _validate_args(args)
@@ -318,19 +348,13 @@ def _parse_args():
 PROMPT_SEGMENTS = [
     {
         "name": "seg_01",
-        "prompt": "A steady medium shot of the red rose, where the camera continues retreating to show the full stem with its leaves and neighboring buds.",
+        "prompt": "A white jeep car is running on the beach, sunny.",
         "frame_num": 49,
         "seed": 42,
     },
     {
         "name": "seg_02",
-        "prompt": "A gentle close shot of a red rose petal, where the camera gradually pulls back to reveal the entire unfurling bloom in its perfect symmetry.",
-        "frame_num": 49,
-        "seed": 42,
-    },
-    {
-        "name": "seg_03",
-        "prompt": "A smooth full shot of the red rose bush, where the camera moves further back to encompass the entire garden bed and surrounding flowering plants.",
+        "prompt": "A white jeep car running on the beach, gradual transition from bright sunset to dark night sky, natural fading light.",
         "frame_num": 49,
         "seed": 42,
     },
@@ -584,7 +608,6 @@ def generate(args):
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}."
         )
-
     if world_size > 1:
         torch.cuda.set_device(local_rank)
         dist.init_process_group(
@@ -726,35 +749,45 @@ def generate(args):
 
     final_video = None
     prev_velocity_tail_cache = None
+    prev_latent_tail_cache = None
     prev_noise_tail_cache = None
     prev_hidden_tail_cache = None
     prev_kv_cache_cond = None
     sink_kv_cache_cond = None
     
     use_velocity_interp = getattr(args, "use_velocity_interp", False)
-    velocity_alpha_start = getattr(args, "velocity_alpha_start", 0.4)
-    velocity_start_step_ratio = getattr(args, "velocity_start_step_ratio", 0.6)
-    velocity_end_step_ratio = getattr(args, "velocity_end_step_ratio", 0.9)
+    velocity_alpha_start = getattr(args, "velocity_alpha_start", 1)
+    velocity_start_step_ratio = getattr(args, "velocity_start_step_ratio", 0)
+    velocity_end_step_ratio = getattr(args, "velocity_end_step_ratio", 0.35)
     velocity_overlap = getattr(args, "velocity_overlap", 2)
+    
+    use_latent_blend = getattr(args, "use_latent_blend", False)
+    latent_blend_overlap = getattr(args, "latent_blend_overlap", 2)
+    latent_blend_alpha_start = getattr(args, "latent_blend_alpha_start", 1)
+    latent_blend_alpha_end = getattr(args, "latent_blend_alpha_end", 0.1)
+    latent_blend_start_step_ratio = getattr(args, "latent_blend_start_step_ratio", 0.35)
+    latent_blend_end_step_ratio = getattr(args, "latent_blend_end_step_ratio", 0.65)
+    
 
     hidden_overlap = getattr(args, "hidden_overlap", 2)
     hidden_alpha = getattr(args, "hidden_alpha", 0.03)
     hidden_use_step_ratio = getattr(args, "hidden_use_step_ratio", 0.4)
     hidden_block_start = getattr(args, "hidden_block_start", 8)
     hidden_block_end = getattr(args, "hidden_block_end", 20)
-    enable_hidden_state_fusion = getattr(args, "disable_hidden_state_fusion", False)
+    enable_hidden_state_fusion = not getattr(args, "disable_hidden_state_fusion", False)
     
     noise_overlap = getattr(args, "noise_overlap", 4)
+    
     latent_overlap = getattr(args, "latent_overlap", 0)
     use_kv_cache = getattr(args, "use_kv_cache", False)
     use_sink_kv_cache = getattr(args, "use_sink_kv_cache", False)
     kv_cache_frames = getattr(args, "kv_cache_frames", 2)
     kv_cache_query_frames = getattr(args, "kv_cache_query_frames", 2)
-    kv_cache_strength = getattr(args, "kv_cache_strength", 0.05)
-    kv_cache_use_start_ratio = getattr(args, "kv_cache_use_start_ratio", 0.45)
-    kv_cache_use_end_ratio = getattr(args, "kv_cache_use_end_ratio", 0.75)
-    kv_block_start = getattr(args, "kv_block_start", 12)
-    kv_block_end = getattr(args, "kv_block_end", 16)
+    kv_cache_strength = getattr(args, "kv_cache_strength", 2)
+    kv_cache_use_start_ratio = getattr(args, "kv_cache_use_start_ratio", 0.01)
+    kv_cache_use_end_ratio = getattr(args, "kv_cache_use_end_ratio", 0.31)
+    kv_block_start = getattr(args, "kv_block_start", 14)
+    kv_block_end = getattr(args, "kv_block_end", 18)
 
    
     # 7. 逐段生成
@@ -801,13 +834,13 @@ def generate(args):
             else None
         )
         logging.info(
-    f"[SinkKV Active] idx={idx}, "
-    f"return_head_kv_cache={return_head_kv_cache}, "
-    f"active_sink_is_none={active_sink_kv_cache_cond is None}, "
-    f"sink_kv_cache_cond_is_none={sink_kv_cache_cond is None}, "
-    f"prev_kv_is_none={prev_kv_cache_cond is None}"
-)
-        (velocity_tail_cache,noise_tail_cache,hidden_tail_cache,kv_cache_cond,cur_video,) = wan_t2v.generate(
+            f"[SinkKV Active] idx={idx}, "
+            f"return_head_kv_cache={return_head_kv_cache}, "
+            f"active_sink_is_none={active_sink_kv_cache_cond is None}, "
+            f"sink_kv_cache_cond_is_none={sink_kv_cache_cond is None}, "
+            f"prev_kv_is_none={prev_kv_cache_cond is None}"
+        )
+        (velocity_tail_cache,latent_tail_cache,noise_tail_cache,hidden_tail_cache,kv_cache_cond,cur_video,) = wan_t2v.generate(
             input_prompt="",
             size=SIZE_CONFIGS[args.size],
             frame_num=item["frame_num"],
@@ -831,7 +864,18 @@ def generate(args):
             velocity_alpha_start=velocity_alpha_start,
             velocity_start_step_ratio=velocity_start_step_ratio,
             velocity_end_step_ratio=velocity_end_step_ratio,
-           
+            
+            # latent blend
+            return_latent_tail_cache=use_latent_blend,
+            prev_latent_tail_cache=(
+            prev_latent_tail_cache if use_latent_blend else None
+),
+            latent_blend_overlap=latent_blend_overlap,
+            latent_blend_alpha_start=latent_blend_alpha_start,
+            latent_blend_alpha_end=latent_blend_alpha_end,
+            latent_blend_start_step_ratio=latent_blend_start_step_ratio,
+            latent_blend_end_step_ratio=latent_blend_end_step_ratio,
+            
             # noise 共享
             return_noise_tail_cache=(noise_overlap > 0),
             prev_noise_tail_cache=(prev_noise_tail_cache if noise_overlap > 0 else None),
@@ -869,6 +913,11 @@ def generate(args):
             prev_velocity_tail_cache = velocity_tail_cache
         else:
             prev_velocity_tail_cache = None
+        
+        if use_latent_blend:
+            prev_latent_tail_cache = latent_tail_cache
+        else:
+            prev_latent_tail_cache = None
 
         prev_noise_tail_cache = noise_tail_cache
 

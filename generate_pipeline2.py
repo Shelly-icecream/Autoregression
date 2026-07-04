@@ -20,52 +20,111 @@ from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import cache_image, cache_video, str2bool
 
 
-EXAMPLE_PROMPT = {
-    "t2v-1.3B": {
-        "prompt":
-            "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
-    },
-    "t2v-14B": {
-        "prompt":
-            "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
-    },
-    "t2i-14B": {
-        "prompt": "一个朴素端庄的美人",
-    },
-    "i2v-14B": {
-        "prompt":
-            "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside.",
-        "image":
-            "examples/i2v_input.JPG",
-    },
-    "flf2v-14B": {
-        "prompt":
-            "CG动画风格，一只蓝色的小鸟从地面起飞，煽动翅膀。小鸟羽毛细腻，胸前有独特的花纹，背景是蓝天白云，阳光明媚。镜跟随小鸟向上移动，展现出小鸟飞翔的姿态和天空的广阔。近景，仰视视角。",
-        "first_frame":
-            "examples/flf2v_input_first_frame.png",
-        "last_frame":
-            "examples/flf2v_input_last_frame.png",
-    },
-    "vace-1.3B": {
-        "src_ref_images":
-            'examples/girl.png,examples/snake.png',
-        "prompt":
-            "在一个欢乐而充满节日气氛的场景中，穿着鲜艳红色春服的小女孩正与她的可爱卡通蛇嬉戏。她的春服上绣着金色吉祥图案，散发着喜庆的气息，脸上洋溢着灿烂的笑容。蛇身呈现出亮眼的绿色，形状圆润，宽大的眼睛让它显得既友善又幽默。小女孩欢快地用手轻轻抚摸着蛇的头部，共同享受着这温馨的时刻。周围五彩斑斓的灯笼和彩带装饰着环境，阳光透过洒在她们身上，营造出一个充满友爱与幸福的新年氛围。"
-    },
-    "vace-14B": {
-        "src_ref_images":
-            'examples/girl.png,examples/snake.png',
-        "prompt":
-            "在一个欢乐而充满节日气氛的场景中，穿着鲜艳红色春服的小女孩正与她的可爱卡通蛇嬉戏。她的春服上绣着金色吉祥图案，散发着喜庆的气息，脸上洋溢着灿烂的笑容。蛇身呈现出亮眼的绿色，形状圆润，宽大的眼睛让它显得既友善又幽默。小女孩欢快地用手轻轻抚摸着蛇的头部，共同享受着这温馨的时刻。周围五彩斑斓的灯笼和彩带装饰着环境，阳光透过洒在她们身上，营造出一个充满友爱与幸福的新年氛围。"
-    }
-}
 
+PROMPT_SEGMENTS = [
+    {
+        "name": "seg_01",
+        "prompt": "A white jeep car is running on the beach, sunny.",
+        "frame_num": 49,
+        "seed": 42,
+    },
+    {
+        "name": "seg_02",
+        "prompt": "A white jeep car running on the beach, gradual transition from bright sunset to dark night sky, natural fading light.",
+        "frame_num": 49,
+        "seed": 42,
+    },
+]
+
+
+NEGATIVE_PROMPT = (
+    "low quality, blurry, distorted, deformed, bad anatomy, "
+    "extra limbs, inconsistent character, flickering, text, watermark"
+)
+
+@torch.no_grad()
+def encode_prompt_to_context(wan_t2v, prompt):
+    """
+    把一个 prompt 输入 Wan2.1 的 text_encoder，得到 context。
+
+    Wan2.1 的 context 通常是 list[tensor]。
+    每个 tensor 是文本条件嵌入，后面会传给 DiT model。
+    """
+
+    device = wan_t2v.device
+
+    if not wan_t2v.t5_cpu:
+        wan_t2v.text_encoder.model.to(device)
+        context = wan_t2v.text_encoder([prompt], device)
+        wan_t2v.text_encoder.model.cpu()
+        torch.cuda.empty_cache()
+    else:
+        context = wan_t2v.text_encoder([prompt], torch.device("cpu"))
+        context = [t.to(device) for t in context]
+
+    return context
+
+@torch.no_grad()
+def build_context_list(wan_t2v, prompt_segments):
+    """
+    输入 prompt 配置列表，输出 context 列表。
+
+    返回结构：
+    [
+        {
+            "name": "seg_01_boxing",
+            "type": "normal",
+            "prompt": "...",
+            "context": context_1,
+            "frame_num": 49,
+            "seed": 42,
+        },
+        ...
+    ]
+    """
+
+    context_items = []
+
+    for seg in prompt_segments:
+        name = seg["name"]
+        prompt = seg["prompt"]
+
+        print(f"[Encode] {name}")
+        print(f"Prompt: {prompt}")
+
+        context = encode_prompt_to_context(wan_t2v, prompt)
+
+        item = {
+            "name": name,
+            "type": "normal",
+            "prompt": prompt,
+            "context": context,
+            "frame_num": seg.get("frame_num", 49),
+            "seed": seg.get("seed", 42),
+        }
+
+        context_items.append(item)
+
+    return context_items
+
+@torch.no_grad()
+def encode_negative_context(wan_t2v, negative_prompt):
+    """
+    生成 classifier-free guidance 里的无条件 / negative context。
+    后面 generate(context_override=...) 时也可能需要传 context_null_override。
+    """
+
+    print("[Encode] negative prompt")
+    print(f"Negative prompt: {negative_prompt}")
+
+    context_null = encode_prompt_to_context(wan_t2v, negative_prompt)
+    return context_null
 
 def _validate_args(args):
     # Basic check
     assert args.ckpt_dir is not None, "Please specify the checkpoint directory."
     assert args.task in WAN_CONFIGS, f"Unsupport task: {args.task}"
-    assert args.task in EXAMPLE_PROMPT, f"Unsupport task: {args.task}"
+    
 
     # The default sampling steps are 40 for image-to-video tasks and 50 for text-to-video tasks.
     if args.sample_steps is None:
@@ -243,28 +302,28 @@ def _parse_args():
         type=float,
         default=5.0,
         help="Classifier free guidance scale.")
-    parser.add_argument("--use_sliding_window", action="store_true", default=False)
-    parser.add_argument(
-    "--prompt_segment",
-    action="append",
-    default=None,
-    help="Repeat this flag for prompt traveling, e.g. --prompt_segment p1 --prompt_segment p2.",
-)
-    parser.add_argument("--latent_window_size", type=int, default=13)
-    parser.add_argument("--latent_stride", type=int, default=4)
-    parser.add_argument(
-    "--window_weight",
-    type=str,
-    default="triangle",
-    choices=["triangle", "flat"],
-)
-    parser.add_argument(
-    "--disable_prompt_lerp",
-    action="store_true",
-    default=False,
-    help="Use nearest prompt segment instead of T5 embedding interpolation.",
-)
-
+    parser.add_argument("--use_text_cross_cache", action="store_true")
+    parser.add_argument("--text_cross_cache_frames", type=int, default=2)
+    parser.add_argument("--text_cross_query_frames", type=int, default=1)
+    parser.add_argument("--text_cross_strength", type=float, default=0.03)
+    parser.add_argument("--text_cross_use_start_ratio", type=float, default=0.20)
+    parser.add_argument("--text_cross_use_end_ratio", type=float, default=0.50)
+    parser.add_argument("--text_cross_block_start", type=int, default=10)
+    parser.add_argument("--text_cross_block_end", type=int, default=16)
+    parser.add_argument("--use_kv_cache", action="store_true")
+    parser.add_argument("--use_sink_kv_cache", action="store_true", default=False)
+    parser.add_argument("--kv_cache_frames", type=int, default=2)
+    parser.add_argument("--kv_cache_query_frames", type=int, default=1)
+    parser.add_argument("--kv_cache_strength", type=float, default=0.005)
+    parser.add_argument("--kv_cache_use_start_ratio", type=float, default=0.35)
+    parser.add_argument("--kv_cache_use_end_ratio", type=float, default=0.65)
+    parser.add_argument("--kv_block_start", type=int, default=13)
+    parser.add_argument("--kv_block_end", type=int, default=17)
+    parser.add_argument("--latent_overlap", type=int, default=2)
+    parser.add_argument("--use_initial_state_cache", action="store_true", default=False)
+    parser.add_argument("--initial_step_start", type=int, default=0)
+    parser.add_argument("--initial_step_end", type=int, default=2)
+    parser.add_argument("--initial_strength", type=float, default=0.1)
     args = parser.parse_args()
 
     _validate_args(args)
@@ -352,8 +411,6 @@ def generate(args):
         args.base_seed = base_seed[0]
 
     if "t2v" in args.task or "t2i" in args.task:
-        if args.prompt is None:
-            args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
         logging.info(f"Input prompt: {args.prompt}")
         if args.use_prompt_extend:
             logging.info("Extending prompt ...")
@@ -388,43 +445,164 @@ def generate(args):
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
         )
-
+        logging.info("Encoding negative context ...")
+        context_null = encode_negative_context(wan_t2v, NEGATIVE_PROMPT)
+        logging.info("Building context list ...")
+        context_items = build_context_list(wan_t2v, PROMPT_SEGMENTS)
+        logging.info(f"Total generation items: {len(context_items)}")
+        
         logging.info(
             f"Generating {'image' if 't2i' in args.task else 'video'} ...")
-        if args.use_sliding_window:
-            assert "t2v" in args.task, "Sliding-window velocity blending is only for T2V."
-            input_prompts = args.prompt_segment if args.prompt_segment else [args.prompt]
-            logging.info(f"Sliding-window prompt segments: {input_prompts}")
-            video = wan_t2v.generate_sliding_window(
-                input_prompts,
-                size=SIZE_CONFIGS[args.size],
-                frame_num=args.frame_num,
-                shift=args.sample_shift,
-                sample_solver=args.sample_solver,
-                sampling_steps=args.sample_steps,
-                guide_scale=args.sample_guide_scale,
-                seed=args.base_seed,
-                offload_model=args.offload_model,
-                latent_window_size=args.latent_window_size,
-                latent_stride=args.latent_stride,
-                window_weight=args.window_weight,
-                prompt_lerp=not args.disable_prompt_lerp,
-            )
-        else:
-            video = wan_t2v.generate(
-                args.prompt,
-                size=SIZE_CONFIGS[args.size],
-                frame_num=args.frame_num,
-                shift=args.sample_shift,
-                sample_solver=args.sample_solver,
-                sampling_steps=args.sample_steps,
-                guide_scale=args.sample_guide_scale,
-                seed=args.base_seed,
-                offload_model=args.offload_model,
-            )
+        
+        final_video = None
+        prev_kv_cache_cond = None
+        sink_kv_cache_cond = None
+        prev_text_cross_cache_cond = None
+        prev_initial_state_cache_cond = None
+        
+        use_kv_cache = getattr(args, "use_kv_cache", False)
+        use_sink_kv_cache = getattr(args, "use_sink_kv_cache", False)
+        use_initial_state_cache = getattr(args, "use_initial_state_cache", False)
 
-    else:
-        raise ValueError(f"Unkown task type: {args.task}")
+        kv_cache_frames = getattr(args, "kv_cache_frames", 2)
+        kv_cache_query_frames = getattr(args, "kv_cache_query_frames", 2)
+        kv_cache_strength = getattr(args, "kv_cache_strength", 2)
+        kv_cache_use_start_ratio = getattr(args, "kv_cache_use_start_ratio", 0.01)
+        kv_cache_use_end_ratio = getattr(args, "kv_cache_use_end_ratio", 0.31)
+        kv_block_start = getattr(args, "kv_block_start", 14)
+        kv_block_end = getattr(args, "kv_block_end", 18)
+        latent_overlap = getattr(args, "latent_overlap", 0)
+        
+        initial_strength = getattr(args, "initial_strength", 0.1)
+        
+        initial_step_start = getattr(args, "initial_step_start", 0)
+        initial_step_end = getattr(args, "initial_step_end", 2)
+        
+        for idx, item in enumerate(context_items):
+            logging.info("=" * 80)
+            logging.info(f"[Generate segment {idx + 1}/{len(context_items)}] {item['name']}")
+            logging.info(f"Prompt: {item['prompt']}")
+            logging.info(f"Seed: {item['seed']}")
+            logging.info(f"Frame num: {item['frame_num']}")
+
+            latent_frames = (item["frame_num"] - 1) // wan_t2v.vae_stride[0] + 1
+            if use_kv_cache:
+                latent_frame_offset = idx * (latent_frames - latent_overlap)
+            else:
+                latent_overlap = 0
+                latent_frame_offset = 0
+                
+            return_head_kv_cache = (use_kv_cache and use_sink_kv_cache and idx == 0)
+            return_initial_state_cache = (use_initial_state_cache and idx == 0)
+
+            active_sink_kv_cache_cond = (
+                sink_kv_cache_cond
+                if (use_kv_cache and use_sink_kv_cache and idx >= 1)
+                else None
+            )
+            active_initial_state_cache_cond = (
+                prev_initial_state_cache_cond
+                if (use_initial_state_cache and idx >= 1)
+                else None
+            )
+            
+            kv_cache_cond,text_cross_cache_cond,initial_state_cache_cond, cur_video = wan_t2v.generate(
+                input_prompt="",
+                size=SIZE_CONFIGS[args.size],
+                frame_num=item["frame_num"],
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=item["seed"],
+                offload_model=args.offload_model,
+
+                context_override=item["context"],
+                context_null_override=context_null,
+
+# KV cache
+            sink_kv_cache_cond=active_sink_kv_cache_cond,
+            return_head_kv_cache=return_head_kv_cache,
+            prev_kv_cache_cond=(
+                prev_kv_cache_cond if use_kv_cache else None
+            ),
+            return_kv_cache=use_kv_cache,
+            kv_cache_frames=kv_cache_frames,
+            kv_cache_query_frames=kv_cache_query_frames,
+            kv_cache_strength=kv_cache_strength,
+            kv_cache_use_start_ratio=kv_cache_use_start_ratio,
+            kv_cache_use_end_ratio=kv_cache_use_end_ratio,
+            kv_block_start=kv_block_start,
+            kv_block_end=kv_block_end,
+            latent_frame_offset=latent_frame_offset,
+
+                prev_text_cross_cache_cond=(
+                    prev_text_cross_cache_cond
+                    if args.use_text_cross_cache else None
+                ),
+                return_text_cross_cache=args.use_text_cross_cache,
+                text_cross_cache_frames=args.text_cross_cache_frames,
+                text_cross_query_frames=args.text_cross_query_frames,
+                text_cross_strength=args.text_cross_strength,
+                text_cross_use_start_ratio=args.text_cross_use_start_ratio,
+                text_cross_use_end_ratio=args.text_cross_use_end_ratio,
+                text_cross_block_start=args.text_cross_block_start,
+                text_cross_block_end=args.text_cross_block_end,
+                                # initial state cache
+                prev_initial_state_cache_cond=active_initial_state_cache_cond,
+                return_initial_state_cache=return_initial_state_cache,
+                initial_step_start=initial_step_start,
+                initial_step_end=initial_step_end,
+                initial_strength=initial_strength
+            )
+            if use_initial_state_cache:
+                if idx == 0:
+                    prev_initial_state_cache_cond = initial_state_cache_cond
+                    logging.info("[InitialStateCache] Saved first-segment initial state cache.")
+                else:
+                    logging.info("[InitialStateCache] Reused first-segment initial state cache.")
+            else:
+                prev_initial_state_cache_cond = None
+                
+                
+            if use_kv_cache:
+                if (use_sink_kv_cache and idx == 0 and kv_cache_cond is not None):
+                    sink_kv_cache_cond = {}
+                    for step_idx, step_cache in enumerate(kv_cache_cond):
+                        if step_cache is None:
+                            sink_kv_cache_cond[step_idx] = None
+                            continue
+                        sink_step_cache = {}
+                        for block_idx, block_cache in step_cache.items():
+                            if ("head_k" in block_cache and "head_v" in block_cache and "head_lens" in block_cache):
+                                sink_step_cache[block_idx] = {
+                                    "k": block_cache["head_k"],
+                                    "v": block_cache["head_v"],
+                                    "lens": block_cache["head_lens"],
+                                }
+                        sink_kv_cache_cond[step_idx] = (sink_step_cache if len(sink_step_cache) > 0 else None)
+                        logging.info("[KVCache] Saved first-segment head KV as Sink cache.")
+                prev_kv_cache_cond = kv_cache_cond
+            else:
+                prev_kv_cache_cond = None
+                sink_kv_cache_cond = None
+                prev_kv_cache_uncond = None
+            if args.use_text_cross_cache:
+                prev_text_cross_cache_cond = text_cross_cache_cond
+            else:
+                prev_text_cross_cache_cond = None
+
+            if cur_video is None:
+                raise RuntimeError(f"Segment {idx} returned None video.")
+
+            if final_video is None:
+                final_video = cur_video
+            else:
+                final_video = torch.cat([final_video, cur_video], dim=1)
+
+        video = final_video
+
+    
 
     if rank == 0:
         if args.save_file is None:

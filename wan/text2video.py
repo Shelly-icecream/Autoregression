@@ -26,6 +26,72 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 
+def _make_latent_windows(total_latent_frames, window_size, stride):
+    """Return inclusive-exclusive temporal windows over latent T."""
+    if window_size <= 0:
+        raise ValueError("latent_window_size must be positive.")
+    if stride <= 0:
+        raise ValueError("latent_stride must be positive.")
+    if window_size > total_latent_frames:
+        window_size = total_latent_frames
+
+    windows = []
+    start = 0
+    while start + window_size <= total_latent_frames:
+        windows.append((start, start + window_size))
+        start += stride
+
+    if not windows:
+        windows.append((0, total_latent_frames))
+    elif windows[-1][1] < total_latent_frames:
+        windows.append((total_latent_frames - window_size, total_latent_frames))
+
+    # Remove duplicate tail window when stride lands exactly at the end.
+    deduped = []
+    for item in windows:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def _window_blend_weight(length, mode, device, dtype):
+    """Create per-frame weights for a latent window."""
+    if mode == "flat" or length <= 2:
+        return torch.ones(1, length, 1, 1, device=device, dtype=dtype)
+    if mode != "triangle":
+        raise ValueError(f"Unsupported window_weight: {mode}")
+
+    pos = torch.linspace(0, 1, length, device=device, dtype=dtype)
+    # Center frames get weight 1, edge frames get weight 0.5.
+    weight = 0.5 + 0.5 * (1.0 - (2.0 * pos - 1.0).abs())
+    return weight.view(1, length, 1, 1)
+
+
+def _lerp_context(contexts, progress, enable_lerp=True):
+    """
+    Interpolate between prompt contexts.
+
+    contexts is the list returned by Wan T5 encoder, one tensor per prompt.
+    If neighboring prompt tensors have different shapes, fall back to nearest
+    prompt selection because torch.lerp requires equal shapes.
+    """
+    if len(contexts) == 1:
+        return [contexts[0]]
+
+    progress = max(0.0, min(1.0, float(progress)))
+    scaled = progress * (len(contexts) - 1)
+    left = int(scaled)
+    right = min(left + 1, len(contexts) - 1)
+    alpha = scaled - left
+
+    if (not enable_lerp) or left == right:
+        return [contexts[left if alpha < 0.5 else right]]
+
+    a, b = contexts[left], contexts[right]
+    if a.shape != b.shape:
+        return [a if alpha < 0.5 else b]
+    return [torch.lerp(a, b, alpha)]
+
 class WanT2V:
 
     def __init__(
@@ -122,27 +188,10 @@ class WanT2V:
                  n_prompt="",
                  seed=-1,
                  offload_model=True,
+                 # 多段生成使用自己的的提示词
                  context_override=None,
                  context_null_override=None,
-                 return_velocity_cache=False,
-                 prev_velocity_tail_cache=None,
-                 velocity_overlap=4,
-                 velocity_alpha_start=0.4,
-                 velocity_start_step_ratio=0.6,
-                 velocity_end_step_ratio=0.9,
-                 
-                 return_noise_tail_cache=False,
-                 prev_noise_tail_cache=None,
-                 noise_overlap=4,
-                 
-                 return_hidden_tail_cache=False,
-                 prev_hidden_tail_cache=None,
-                 hidden_overlap=2,
-                 hidden_alpha=0.03,
-                 hidden_use_step_ratio=0.4,
-                 hidden_block_start=8,
-                 hidden_block_end=20,
-                 
+                 # kv cache
                  return_kv_cache=False,
                  return_head_kv_cache=False,
                  prev_kv_cache_cond=None,
@@ -152,11 +201,25 @@ class WanT2V:
                  kv_cache_strength=0.08,
                  kv_cache_use_start_ratio=0.45,
                  kv_cache_use_end_ratio=0.75,
-                 latent_frame_offset=0,
-                 enable_hidden_state_fusion=True,
                  kv_block_start=12,
                  kv_block_end=16,
-                 ):
+                 latent_frame_offset=0,
+                 # text cross-attention cache, text_out=attn_map@V_text
+                 prev_text_cross_cache_cond=None,
+                 return_text_cross_cache=False,
+                 text_cross_cache_frames=2,
+                 text_cross_query_frames=1,
+                 text_cross_strength=0.03,
+text_cross_use_start_ratio=0.20,
+text_cross_use_end_ratio=0.50,
+text_cross_block_start=10,
+text_cross_block_end=16,
+prev_initial_state_cache_cond=None,
+return_initial_state_cache=False,
+initial_step_start=0,
+initial_step_end=2,
+initial_strength=0.1,
+):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -240,30 +303,7 @@ class WanT2V:
                 device=self.device,
                 generator=seed_g)
         ]
-        # initial noise sharing: previous segment tail -> current segment head
-        if prev_noise_tail_cache is not None and noise_overlap > 0:
-            prev_tail = prev_noise_tail_cache
 
-        # 如果外层传进来的是 list/tuple，就取第一个
-            if isinstance(prev_tail, (list, tuple)):
-                prev_tail = prev_tail[0]
- 
-            prev_tail = prev_tail.to(
-                    device=noise[0].device,
-                    dtype=noise[0].dtype
-        )
-
-            current_overlap = min(
-                    noise_overlap,
-                    prev_tail.shape[1],
-                    noise[0].shape[1],
-        )
-            if current_overlap > 0:
-                noise[0][:, :current_overlap, :, :] = prev_tail[:, -current_overlap:, :, :]
-        if return_noise_tail_cache and noise_overlap > 0:
-            noise_tail_cache = noise[0][:, -noise_overlap:, :, :].detach().cpu().clone()
-        else:
-            noise_tail_cache = None
         @contextmanager
         def noop_no_sync():
             yield
@@ -299,20 +339,18 @@ class WanT2V:
 
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
-            velocity_tail_cache = [] if return_velocity_cache else None
-            hidden_tail_cache = [] if return_hidden_tail_cache else None
-            
             kv_cache_cond = [] if return_kv_cache else None
-            
-            
+            text_cross_cache_cond = [] if return_text_cross_cache else None
+            initial_state_cache_cond = [] if return_initial_state_cache else None
             num_steps = len(timesteps)
+
             for step_idx, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
-
                 timestep = torch.stack(timestep)
 
                 self.model.to(self.device)
+                # 在特定去噪步骤范围内使用kv缓存
                 kv_cache_start_step = int(num_steps * kv_cache_use_start_ratio)
                 kv_cache_end_step = int(num_steps * kv_cache_use_end_ratio)
 
@@ -322,202 +360,117 @@ class WanT2V:
                     and step_idx < len(prev_kv_cache_cond)
                     and prev_kv_cache_cond[step_idx] is not None
                 )   
-
                 prev_step_kv_cond = (prev_kv_cache_cond[step_idx]if use_kv_cache else None)
+                
                 use_sink_kv_cache = (
                     sink_kv_cache_cond is not None
                     and kv_cache_start_step <= step_idx < kv_cache_end_step
                     and step_idx < len(sink_kv_cache_cond)
                     and sink_kv_cache_cond[step_idx] is not None
                 )
-
                 sink_step_kv_cond = (sink_kv_cache_cond[step_idx]if use_sink_kv_cache else None)
 
                 use_any_kv_cache = use_kv_cache or use_sink_kv_cache
                
                 cur_kv_cond = None
-                
-                # ============================================================
-                # hidden state fusion/cache 只作用在 cond 分支
-                # ============================================================
-                use_hidden_fusion = (
-                    enable_hidden_state_fusion
-                    and prev_hidden_tail_cache is not None
-                    and step_idx < int(num_steps * hidden_use_step_ratio)
-                    and step_idx < len(prev_hidden_tail_cache)
-                )
-
-                cur_hidden_cache = {} if return_hidden_tail_cache else None
-
-                if return_hidden_tail_cache or use_hidden_fusion:
-                    self.model.hidden_fusion_runtime = {
-                    "enabled": use_hidden_fusion,
-                    "return_cache": return_hidden_tail_cache,
-                    "prev_cache": (
-                     prev_hidden_tail_cache[step_idx]
-                     if use_hidden_fusion else None
-                    ),
-                    "cur_cache": cur_hidden_cache,
-                    "overlap": hidden_overlap,
-                    "alpha": hidden_alpha,
-                    "block_start": hidden_block_start,
-                    "block_end": hidden_block_end,
-                }
-                else:
-                    self.model.hidden_fusion_runtime = None
-                    
-                if step_idx == 0:
-                    print(
-                    "[HiddenFusion Runtime]",
-                    "prev_hidden_tail_cache is None =", prev_hidden_tail_cache is None,
-                    "return_hidden_tail_cache =", return_hidden_tail_cache,
-                    "use_hidden_fusion =", use_hidden_fusion,
-                    "hidden_overlap =", hidden_overlap,
-                    "hidden_alpha =", hidden_alpha,
-                    "hidden_block_range =", hidden_block_start, hidden_block_end,
-                )
-                
                 should_return_kv_cache = (return_kv_cache and kv_cache_start_step <= step_idx < kv_cache_end_step)
-                if should_return_kv_cache:
-                    noise_pred_cond_list, cur_kv_cond = self.model(
-                        latent_model_input,
-                        t=timestep,
-                        **arg_c,
-                        frame_offset=latent_frame_offset,
-                        prev_kv_cache=prev_step_kv_cond,
-                        sink_kv_cache=sink_step_kv_cond,
-                        return_kv_cache=True,
-                        return_head_kv_cache=return_head_kv_cache,
-                        cache_frames=kv_cache_frames,
-                        cache_query_frames=(kv_cache_query_frames if use_kv_cache else 0),
-                        cache_strength=(kv_cache_strength if use_kv_cache else 0.0),
-                        enable_hidden_state_fusion=enable_hidden_state_fusion,
-                        kv_block_start=kv_block_start,
-                        kv_block_end=kv_block_end,
-                    )
-                    noise_pred_cond = noise_pred_cond_list[0]
-                else:
-                    noise_pred_cond = self.model(
-                        latent_model_input,
-                        t=timestep,
-                        **arg_c,
-                        frame_offset=latent_frame_offset,
-                        return_kv_cache=False,
-                        enable_hidden_state_fusion=enable_hidden_state_fusion,
-                    )[0]
-                if return_kv_cache and step_idx in [
-                    kv_cache_start_step,
-                    kv_cache_start_step + 1,
-                    kv_cache_end_step - 1,
-]:
-                    print(
-        "[KVCache StepCheck]",
-        "step_idx =", step_idx,
-        "start =", kv_cache_start_step,
-        "end =", kv_cache_end_step,
-        "prev_kv_cache_cond is None =", prev_kv_cache_cond is None,
-        "use_kv_cache =", use_kv_cache,
-        "should_return_kv_cache =", should_return_kv_cache,
-        "prev_step_kv_cond is None =", prev_step_kv_cond is None,
-        "prev_step_blocks =",
-        (
-            sorted(list(prev_step_kv_cond.keys()))
-            if prev_step_kv_cond is not None else None
-        ),
-    )
-                if return_hidden_tail_cache:
-                    hidden_tail_cache.append(cur_hidden_cache)
+                # 在特定去噪步骤范围内使用文本交叉注意力缓存
+                text_cross_start_step = int(num_steps * text_cross_use_start_ratio)
+                text_cross_end_step = int(num_steps * text_cross_use_end_ratio)
 
-                    if step_idx == 0:
-                        print(
-                        "[HiddenFusion AfterCond]",
-                        "cur_hidden_cache is None =", cur_hidden_cache is None,
-                        "num_saved_blocks =", len(cur_hidden_cache) if cur_hidden_cache is not None else None,
-                        "saved_keys =", list(cur_hidden_cache.keys())[:10] if cur_hidden_cache is not None else None,
-                        )
+                use_prev_text_cross_cache = (
+                    prev_text_cross_cache_cond is not None
+                    and text_cross_start_step <= step_idx < text_cross_end_step
+                    and step_idx < len(prev_text_cross_cache_cond)
+                    and prev_text_cross_cache_cond[step_idx] is not None
+                )
 
-                        if cur_hidden_cache is not None and len(cur_hidden_cache) > 0:
-                            first_key = sorted(cur_hidden_cache.keys())[0]
-                            print(
-                            "[HiddenFusion AfterCond Example]",
-                            "block =", first_key,
-                            "shape =", tuple(cur_hidden_cache[first_key].shape),
-                        )             
-                self.model.hidden_fusion_runtime = None
-   
+                prev_step_text_cross_cache = (
+                    prev_text_cross_cache_cond[step_idx]
+                    if use_prev_text_cross_cache else None
+                )
+
+                should_return_text_cross_cache = (
+                    return_text_cross_cache
+                    and text_cross_start_step <= step_idx < text_cross_end_step
+                )
+                # 在特定去噪步骤范围内使用初始状态缓存
+                use_prev_initial_state_cache = (
+                    prev_initial_state_cache_cond is not None
+                    and initial_step_start <= step_idx < initial_step_end
+                    and step_idx < len(prev_initial_state_cache_cond)
+                    and prev_initial_state_cache_cond[step_idx] is not None
+                )
+                prev_step_initial_state_cache = (
+                    prev_initial_state_cache_cond[step_idx]
+                    if use_prev_initial_state_cache else None
+                )
+                should_return_initial_state_cache = (
+                    return_initial_state_cache
+                    and initial_step_start <= step_idx < initial_step_end
+                )
+                cond_out = self.model(
+                    latent_model_input,
+                    t=timestep,
+                    **arg_c,
+                    # KV cache
+                    frame_offset=latent_frame_offset,
+                    prev_kv_cache=prev_step_kv_cond,
+                    sink_kv_cache=sink_step_kv_cond,
+                    return_kv_cache=should_return_kv_cache,
+                    return_head_kv_cache=(
+        return_head_kv_cache and should_return_kv_cache
+    ),
+    cache_frames=kv_cache_frames,
+    cache_query_frames=(
+        kv_cache_query_frames if use_kv_cache else 0
+    ),
+    cache_strength=(
+        kv_cache_strength if use_kv_cache else 0.0
+    ),
+    kv_block_start=kv_block_start,
+    kv_block_end=kv_block_end,
+                    prev_text_cross_cache=prev_step_text_cross_cache,
+                    return_text_cross_cache=should_return_text_cross_cache,
+                    text_cross_cache_frames=text_cross_cache_frames,
+                    text_cross_query_frames=text_cross_query_frames,
+                    text_cross_strength=text_cross_strength,
+                    text_cross_block_start=text_cross_block_start,
+                    text_cross_block_end=text_cross_block_end,
+                    initial_strength=initial_strength,
+                    prev_initial_state_cache=prev_step_initial_state_cache,
+                    return_initial_state_cache=should_return_initial_state_cache,
+                    
+                )
+
                 
-                noise_pred_uncond = self.model(
-        latent_model_input,
-        t=timestep,
-        **arg_null,
-        frame_offset=latent_frame_offset,
-        return_kv_cache=False,
-        enable_hidden_state_fusion=False,
-    )[0]                
+                noise_pred_cond_list, cur_kv_cond, cur_text_cross_cache, cur_initial_state_cache = cond_out
+                noise_pred_cond = noise_pred_cond_list[0]
+
                 if return_kv_cache:
                     kv_cache_cond.append(cur_kv_cond)
-                if return_kv_cache and step_idx in [
-    kv_cache_start_step,
-    kv_cache_start_step + 1,
-    kv_cache_end_step - 1,
-]:
-                    print(
-        "[KVCache SaveCheck]",
-        "step_idx =", step_idx,
-        "cur_kv_cond is None =", cur_kv_cond is None,
-                        "saved_blocks =",
-        (sorted(list(cur_kv_cond.keys())) if cur_kv_cond is not None else None ),
-    )
+                if return_text_cross_cache:
+                    text_cross_cache_cond.append(cur_text_cross_cache)
+                if return_initial_state_cache:
+                    initial_state_cache_cond.append(cur_initial_state_cache)
 
-                    if cur_kv_cond is not None and len(cur_kv_cond) > 0:
-                        first_block = sorted(list(cur_kv_cond.keys()))[0]
-                        print(
-            "[KVCache SaveExample]",
-            "block =", first_block,
-            "k_shape =", tuple(cur_kv_cond[first_block]["k"].shape),
-            "v_shape =", tuple(cur_kv_cond[first_block]["v"].shape),
-            "lens =", cur_kv_cond[first_block]["lens"],
-            "k_device =", cur_kv_cond[first_block]["k"].device,
-            "v_device =", cur_kv_cond[first_block]["v"].device,
-            "k_dtype =", cur_kv_cond[first_block]["k"].dtype,
-            "v_dtype =", cur_kv_cond[first_block]["v"].dtype,
-        )
+                noise_pred_uncond = self.model(
+                    latent_model_input,
+                    t=timestep,
+                    **arg_null,
+                    frame_offset=latent_frame_offset,
+                    prev_text_cross_cache=None,
+                    return_text_cross_cache=False,
+                    text_cross_cache_frames=text_cross_cache_frames,
+                    text_cross_query_frames=text_cross_query_frames,
+                    text_cross_strength=0.0,
+                    text_cross_block_start=text_cross_block_start,
+                    text_cross_block_end=text_cross_block_end,
+                )[0][0]                
+                
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
-                if return_velocity_cache:
-                    velocity_tail_cache.append(
-                        noise_pred[:, -velocity_overlap:, :, :].detach().cpu().clone()
-                    )
-                
-                velocity_start_step = int(num_steps * velocity_start_step_ratio)
-                velocity_end_step = int(num_steps * velocity_end_step_ratio)
-                if prev_velocity_tail_cache is not None:
-                    if velocity_start_step <= step_idx < velocity_end_step and step_idx < len(prev_velocity_tail_cache):
-                        v_A = prev_velocity_tail_cache[step_idx].to(
-                        device=noise_pred.device,
-                        dtype=noise_pred.dtype
-                        )
 
-                        # 防止 overlap 超过当前 T
-                        current_overlap = min(
-                        velocity_overlap,
-                        v_A.shape[1],
-                        noise_pred.shape[1],
-                        )
-
-                        v_A = v_A[:, -current_overlap:, :, :]
-                        v_B = noise_pred[:, :current_overlap, :, :]
-
-                        # 视频时间维衰减：B 的第一个 latent-frame 继承强，后面逐渐减弱
-                        alpha_frame = torch.linspace(
-                        velocity_alpha_start,
-                        0.0,
-                        current_overlap,
-                        device=noise_pred.device,
-                        dtype=noise_pred.dtype
-                        ).view(1, current_overlap, 1, 1)
-
-                        noise_pred[:, :current_overlap, :, :] = (  alpha_frame * v_A + (1.0 - alpha_frame) * v_B  )
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
                     t,
@@ -525,7 +478,7 @@ class WanT2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
-                
+
             x0 = latents
             if offload_model:
                 self.model.cpu()
@@ -540,14 +493,200 @@ class WanT2V:
             torch.cuda.synchronize()
         if dist.is_initialized():
             dist.barrier()
-
         video = videos[0] if self.rank == 0 else None
-        if hasattr(self.model, "hidden_fusion_runtime"):
-            self.model.hidden_fusion_runtime = None
-        return (
-    velocity_tail_cache,
-    noise_tail_cache,
-    hidden_tail_cache,
-    kv_cache_cond,
-    video,
-)
+        return kv_cache_cond,text_cross_cache_cond,initial_state_cache_cond, video
+        
+    def generate_sliding_window(
+        self,
+        input_prompts,
+        size=(1280, 720),
+        frame_num=81,
+        shift=5.0,
+        sample_solver="unipc",
+        sampling_steps=50,
+        guide_scale=5.0,
+        n_prompt="",
+        seed=-1,
+        offload_model=True,
+        latent_window_size=13,
+        latent_stride=4,
+        window_weight="triangle",
+        prompt_lerp=True,
+    ):
+        """
+        Generate long T2V with temporal latent windows and velocity blending.
+        """
+        if isinstance(input_prompts, str):
+            input_prompts = [input_prompts]
+        input_prompts = [p.strip() for p in input_prompts if p and p.strip()]
+        if not input_prompts:
+            raise ValueError("input_prompts must contain at least one prompt.")
+
+        F = frame_num
+        target_shape = (
+            self.vae.model.z_dim,
+            (F - 1) // self.vae_stride[0] + 1,
+            size[1] // self.vae_stride[1],
+            size[0] // self.vae_stride[2],
+        )
+        total_latent_frames = target_shape[1]
+        windows = _make_latent_windows(
+            total_latent_frames,
+            latent_window_size,
+            latent_stride,
+        )
+
+        if n_prompt == "":
+            n_prompt = self.sample_neg_prompt
+        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
+        seed_g = torch.Generator(device=self.device)
+        seed_g.manual_seed(seed)
+
+        if not self.t5_cpu:
+            self.text_encoder.model.to(self.device)
+            contexts = self.text_encoder(input_prompts, self.device)
+            context_null = self.text_encoder([n_prompt], self.device)
+            if offload_model:
+                self.text_encoder.model.cpu()
+        else:
+            contexts = self.text_encoder(input_prompts, torch.device("cpu"))
+            context_null = self.text_encoder([n_prompt], torch.device("cpu"))
+            contexts = [t.to(self.device) for t in contexts]
+            context_null = [t.to(self.device) for t in context_null]
+
+        latent = torch.randn(
+            target_shape[0],
+            target_shape[1],
+            target_shape[2],
+            target_shape[3],
+            dtype=torch.float32,
+            device=self.device,
+            generator=seed_g,
+        )
+
+        @contextmanager
+        def noop_no_sync():
+            yield
+
+        no_sync = getattr(self.model, "no_sync", noop_no_sync)
+
+        with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+            if sample_solver == "unipc":
+                sample_scheduler = FlowUniPCMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False,
+                )
+                sample_scheduler.set_timesteps(
+                    sampling_steps,
+                    device=self.device,
+                    shift=shift,
+                )
+                timesteps = sample_scheduler.timesteps
+            elif sample_solver == "dpm++":
+                sample_scheduler = FlowDPMSolverMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False,
+                )
+                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                timesteps, _ = retrieve_timesteps(
+                    sample_scheduler,
+                    device=self.device,
+                    sigmas=sampling_sigmas,
+                )
+            else:
+                raise NotImplementedError("Unsupported solver.")
+
+            self.model.to(self.device)
+
+            logging.info(
+                "[SlidingWindow] frame_num=%s latent_T=%s windows=%s "
+                "latent_window_size=%s latent_stride=%s prompts=%s",
+                frame_num,
+                total_latent_frames,
+                windows,
+                latent_window_size,
+                latent_stride,
+                len(input_prompts),
+            )
+
+            for _, t in enumerate(tqdm(timesteps)):
+                velocity_acc = torch.zeros_like(latent)
+                weight_acc = torch.zeros_like(latent)
+                timestep = torch.stack([t]).to(self.device)
+
+                for start, end in windows:
+                    latent_slice = latent[:, start:end, :, :]
+                    window_t = end - start
+                    seq_len = math.ceil(
+                        (target_shape[2] * target_shape[3])
+                        / (self.patch_size[1] * self.patch_size[2])
+                        * window_t
+                        / self.sp_size
+                    ) * self.sp_size
+
+                    center = (start + end - 1) * 0.5
+                    progress = center / max(total_latent_frames - 1, 1)
+                    context = _lerp_context(contexts, progress, prompt_lerp)
+
+                    arg_c = {"context": context, "seq_len": seq_len}
+                    arg_null = {"context": context_null, "seq_len": seq_len}
+                    latent_model_input = [latent_slice]
+
+                    velocity_cond = self.model(
+                        latent_model_input,
+                        t=timestep,
+                        **arg_c,
+                    )[0]
+                    velocity_uncond = self.model(
+                        latent_model_input,
+                        t=timestep,
+                        **arg_null,
+                    )[0]
+                    velocity = velocity_uncond + guide_scale * (
+                        velocity_cond - velocity_uncond
+                    )
+
+                    weight = _window_blend_weight(
+                        window_t,
+                        window_weight,
+                        latent.device,
+                        latent.dtype,
+                    )
+                    velocity_acc[:, start:end, :, :] += velocity * weight
+                    weight_acc[:, start:end, :, :] += weight
+
+                    del latent_model_input, velocity_cond, velocity_uncond, velocity
+
+                global_velocity = velocity_acc / weight_acc.clamp_min(1e-6)
+
+                latent = sample_scheduler.step(
+                    global_velocity.unsqueeze(0),
+                    t,
+                    latent.unsqueeze(0),
+                    return_dict=False,
+                    generator=seed_g,
+                )[0].squeeze(0)
+
+                del velocity_acc, weight_acc, global_velocity, timestep
+                if offload_model:
+                    torch.cuda.empty_cache()
+
+            x0 = [latent]
+            if offload_model:
+                self.model.cpu()
+                torch.cuda.empty_cache()
+
+            if self.rank == 0:
+                videos = self.vae.decode(x0)
+
+        del latent
+        del sample_scheduler
+        if offload_model:
+            gc.collect()
+            torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
+
+        return videos[0] if self.rank == 0 else None
