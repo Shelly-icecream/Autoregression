@@ -324,6 +324,8 @@ def _parse_args():
     parser.add_argument("--initial_step_start", type=int, default=0)
     parser.add_argument("--initial_step_end", type=int, default=2)
     parser.add_argument("--initial_strength", type=float, default=0.1)
+    parser.add_argument("--initial_block_start", type=int, default=0)
+    parser.add_argument("--initial_block_end", type=int, default=2)
     args = parser.parse_args()
 
     _validate_args(args)
@@ -477,7 +479,9 @@ def generate(args):
         
         initial_step_start = getattr(args, "initial_step_start", 0)
         initial_step_end = getattr(args, "initial_step_end", 2)
-        
+        initial_block_start=getattr(args, "initial_block_start", 0)
+        initial_block_end=getattr(args, "initial_block_end", 2)
+
         for idx, item in enumerate(context_items):
             logging.info("=" * 80)
             logging.info(f"[Generate segment {idx + 1}/{len(context_items)}] {item['name']}")
@@ -520,21 +524,21 @@ def generate(args):
                 context_override=item["context"],
                 context_null_override=context_null,
 
-# KV cache
-            sink_kv_cache_cond=active_sink_kv_cache_cond,
-            return_head_kv_cache=return_head_kv_cache,
-            prev_kv_cache_cond=(
-                prev_kv_cache_cond if use_kv_cache else None
-            ),
-            return_kv_cache=use_kv_cache,
-            kv_cache_frames=kv_cache_frames,
-            kv_cache_query_frames=kv_cache_query_frames,
-            kv_cache_strength=kv_cache_strength,
-            kv_cache_use_start_ratio=kv_cache_use_start_ratio,
-            kv_cache_use_end_ratio=kv_cache_use_end_ratio,
-            kv_block_start=kv_block_start,
-            kv_block_end=kv_block_end,
-            latent_frame_offset=latent_frame_offset,
+                # KV cache
+                sink_kv_cache_cond=active_sink_kv_cache_cond,
+                return_head_kv_cache=return_head_kv_cache,
+                prev_kv_cache_cond=(
+                    prev_kv_cache_cond if use_kv_cache else None
+                ),
+                return_kv_cache=use_kv_cache,
+                kv_cache_frames=kv_cache_frames,
+                kv_cache_query_frames=kv_cache_query_frames,
+                kv_cache_strength=kv_cache_strength,
+                kv_cache_use_start_ratio=kv_cache_use_start_ratio,
+                kv_cache_use_end_ratio=kv_cache_use_end_ratio,
+                kv_block_start=kv_block_start,
+                kv_block_end=kv_block_end,
+                latent_frame_offset=latent_frame_offset,
 
                 prev_text_cross_cache_cond=(
                     prev_text_cross_cache_cond
@@ -548,12 +552,14 @@ def generate(args):
                 text_cross_use_end_ratio=args.text_cross_use_end_ratio,
                 text_cross_block_start=args.text_cross_block_start,
                 text_cross_block_end=args.text_cross_block_end,
-                                # initial state cache
+                # initial state cache
                 prev_initial_state_cache_cond=active_initial_state_cache_cond,
                 return_initial_state_cache=return_initial_state_cache,
                 initial_step_start=initial_step_start,
                 initial_step_end=initial_step_end,
-                initial_strength=initial_strength
+                initial_strength=initial_strength,
+                block_start_index=initial_block_start,
+                block_end_index=initial_block_end
             )
             if use_initial_state_cache:
                 if idx == 0:

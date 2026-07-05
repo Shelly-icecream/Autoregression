@@ -623,25 +623,26 @@ class WanAttentionBlock(nn.Module):
             if initial_state is not None:
                 #x = x+initial_strength*initial_state.to(device=x.device, dtype=x.dtype)
                 x= initial_state.to(device=x.device, dtype=x.dtype)
+                
+                
             if prev_text_cross_cache is not None and text_cross_strength > 0:
                 prev_tail = prev_text_cross_cache.to(
                     device=x.device,
                     dtype=x.dtype,
                 )
-
                 query_token_num = min(
                     text_cross_query_frames * tokens_per_frame,
                     prev_tail.shape[1],
                     x.shape[1],
                 )
-
                 if query_token_num > 0:
                     prev_tail = prev_tail[:, -query_token_num:, :]
-
                     x[:, :query_token_num, :] = (
                         x[:, :query_token_num, :]
                         + text_cross_strength * prev_tail
                     )
+                    
+                    
             initial_state_cache=None
             if return_initial_state_cache:
                 initial_state_cache = x.detach().clone()
@@ -845,30 +846,31 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
-        # KV cache / RoPE offset 新增参数
-        frame_offset=0,
-        prev_kv_cache=None,
-        sink_kv_cache=None,
-        return_kv_cache=False,
-        return_head_kv_cache=False,
-        cache_frames=0,
-        cache_query_frames=0,
-        cache_strength=0.0,
-        enable_hidden_state_fusion=True,
-        kv_block_start=8,
-        kv_block_end=20,
-        # text cross-attention cache, text_out=attn_map@V_text
+         # KV cache / RoPE offset 新增参数
+         frame_offset=0,
+         prev_kv_cache=None,
+         sink_kv_cache=None,
+         return_kv_cache=False,
+         return_head_kv_cache=False,
+         cache_frames=0,
+         cache_query_frames=0,
+         cache_strength=0.0,
+         enable_hidden_state_fusion=True,
+         kv_block_start=8,
+         kv_block_end=20,
+         # text cross-attention cache, text_out=attn_map@V_text
          prev_text_cross_cache=None,
-    return_text_cross_cache=False,
-    text_cross_cache_frames=2,
-    text_cross_query_frames=1,
-    text_cross_strength=0.03,
-    text_cross_block_start=10,
-    text_cross_block_end=16,
-    initial_strength=0.1,
-    prev_initial_state_cache=None,
-    return_initial_state_cache=False,
-        
+         return_text_cross_cache=False,
+         text_cross_cache_frames=2,
+         text_cross_query_frames=1,
+         text_cross_strength=0.03,
+         text_cross_block_start=10,
+         text_cross_block_end=16,
+         initial_strength=0.1,
+         prev_initial_state_cache=None,
+         return_initial_state_cache=False,
+         block_start_index=0,
+         block_end_index=2,
     ):
         r"""
         Forward pass through the diffusion model
@@ -944,10 +946,10 @@ class WanModel(ModelMixin, ConfigMixin):
             )
         new_kv_cache = {} if return_kv_cache else None
         cur_text_cross_cache = {} if return_text_cross_cache else None
-        cur_initial_state_cache = None
+        cur_initial_state_cache = {} if return_initial_state_cache else None
         
         # 在特定的block范围内使用和保存text cross-attention cache
-        # 在第一个block中使用和保存initial state
+        # 在特定的block中使用和保存initial state
         for block_idx, block in enumerate(self.blocks):
             block_use_kv = (
                 block_idx >= kv_block_start
@@ -968,7 +970,7 @@ class WanModel(ModelMixin, ConfigMixin):
             if block_use_kv and sink_kv_cache is not None:
                 block_sink_kv_cache = sink_kv_cache.get(block_idx, None)
 
-
+            # 取出前一段中对应 block 的 text cross-attention cache
             prev_block_text_cross = None
             if (
                 prev_text_cross_cache is not None
@@ -976,6 +978,16 @@ class WanModel(ModelMixin, ConfigMixin):
                 and block_idx in prev_text_cross_cache
             ):
                 prev_block_text_cross = prev_text_cross_cache[block_idx]
+                
+            # 取出前一段中对应 block 的 initial state cache
+            use_initial_state_block = (block_start_index <= block_idx < block_end_index)
+            prev_block_initial_state = None
+            if (
+                prev_initial_state_cache is not None
+                and use_initial_state_block
+                and isinstance(prev_initial_state_cache, dict)
+            ):
+                prev_block_initial_state = prev_initial_state_cache.get(block_idx, None)
 
             x, block_new_kv_cache,block_text_cross_tail, block_initial_state_cache = block(
                 x,
@@ -1007,19 +1019,17 @@ class WanModel(ModelMixin, ConfigMixin):
                 text_cross_query_frames=text_cross_query_frames,
                 text_cross_strength=text_cross_strength,
                 initial_strength=initial_strength,
-                initial_state=(
-                    prev_initial_state_cache if block_idx == 0 else None
-                ),
-                return_initial_state_cache=(return_initial_state_cache and block_idx == 0)
-                
+                initial_state=prev_block_initial_state,
+                return_initial_state_cache=(return_initial_state_cache and use_initial_state_block)
+
             )
 
             if return_text_cross_cache and cur_text_cross_cache is not None and block_text_cross_tail is not None:
                 cur_text_cross_cache[block_idx] = block_text_cross_tail
             if return_kv_cache and new_kv_cache is not None and block_new_kv_cache is not None:
                 new_kv_cache[block_idx] = block_new_kv_cache
-            if return_initial_state_cache and block_idx == 0 and block_initial_state_cache is not None:
-                cur_initial_state_cache = block_initial_state_cache
+            if return_initial_state_cache and use_initial_state_block and block_initial_state_cache is not None:
+                cur_initial_state_cache[block_idx] = block_initial_state_cache
 
         # head
         x = self.head(x, e)

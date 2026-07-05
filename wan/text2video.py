@@ -219,6 +219,8 @@ return_initial_state_cache=False,
 initial_step_start=0,
 initial_step_end=2,
 initial_strength=0.1,
+block_start_index=0,
+block_end_index=2,
 ):
         r"""
         Generates video frames from text prompt using diffusion process.
@@ -350,10 +352,11 @@ initial_strength=0.1,
                 timestep = torch.stack(timestep)
 
                 self.model.to(self.device)
+                
+                
                 # 在特定去噪步骤范围内使用kv缓存
                 kv_cache_start_step = int(num_steps * kv_cache_use_start_ratio)
                 kv_cache_end_step = int(num_steps * kv_cache_use_end_ratio)
-
                 use_kv_cache = (
                     prev_kv_cache_cond is not None
                     and kv_cache_start_step <= step_idx < kv_cache_end_step
@@ -361,7 +364,6 @@ initial_strength=0.1,
                     and prev_kv_cache_cond[step_idx] is not None
                 )   
                 prev_step_kv_cond = (prev_kv_cache_cond[step_idx]if use_kv_cache else None)
-                
                 use_sink_kv_cache = (
                     sink_kv_cache_cond is not None
                     and kv_cache_start_step <= step_idx < kv_cache_end_step
@@ -369,31 +371,30 @@ initial_strength=0.1,
                     and sink_kv_cache_cond[step_idx] is not None
                 )
                 sink_step_kv_cond = (sink_kv_cache_cond[step_idx]if use_sink_kv_cache else None)
-
                 use_any_kv_cache = use_kv_cache or use_sink_kv_cache
-               
                 cur_kv_cond = None
                 should_return_kv_cache = (return_kv_cache and kv_cache_start_step <= step_idx < kv_cache_end_step)
+                
+                
                 # 在特定去噪步骤范围内使用文本交叉注意力缓存
                 text_cross_start_step = int(num_steps * text_cross_use_start_ratio)
                 text_cross_end_step = int(num_steps * text_cross_use_end_ratio)
-
                 use_prev_text_cross_cache = (
                     prev_text_cross_cache_cond is not None
                     and text_cross_start_step <= step_idx < text_cross_end_step
                     and step_idx < len(prev_text_cross_cache_cond)
                     and prev_text_cross_cache_cond[step_idx] is not None
                 )
-
                 prev_step_text_cross_cache = (
                     prev_text_cross_cache_cond[step_idx]
                     if use_prev_text_cross_cache else None
                 )
-
                 should_return_text_cross_cache = (
                     return_text_cross_cache
                     and text_cross_start_step <= step_idx < text_cross_end_step
                 )
+                
+                
                 # 在特定去噪步骤范围内使用初始状态缓存
                 use_prev_initial_state_cache = (
                     prev_initial_state_cache_cond is not None
@@ -419,17 +420,17 @@ initial_strength=0.1,
                     sink_kv_cache=sink_step_kv_cond,
                     return_kv_cache=should_return_kv_cache,
                     return_head_kv_cache=(
-        return_head_kv_cache and should_return_kv_cache
+                    return_head_kv_cache and should_return_kv_cache
     ),
-    cache_frames=kv_cache_frames,
-    cache_query_frames=(
+                    cache_frames=kv_cache_frames,
+                    cache_query_frames=(
         kv_cache_query_frames if use_kv_cache else 0
     ),
-    cache_strength=(
+                    cache_strength=(
         kv_cache_strength if use_kv_cache else 0.0
     ),
-    kv_block_start=kv_block_start,
-    kv_block_end=kv_block_end,
+                    kv_block_start=kv_block_start,
+                    kv_block_end=kv_block_end,
                     prev_text_cross_cache=prev_step_text_cross_cache,
                     return_text_cross_cache=should_return_text_cross_cache,
                     text_cross_cache_frames=text_cross_cache_frames,
@@ -440,7 +441,8 @@ initial_strength=0.1,
                     initial_strength=initial_strength,
                     prev_initial_state_cache=prev_step_initial_state_cache,
                     return_initial_state_cache=should_return_initial_state_cache,
-                    
+                    block_start_index=block_start_index,
+                    block_end_index=block_end_index
                 )
 
                 
